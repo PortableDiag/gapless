@@ -1,0 +1,150 @@
+# Architecture
+
+## The engine is a mixer timeline, not a playlist
+
+`src/player.rs` builds one long-lived pipeline:
+
+```
+audiomixer ─ audioconvert ─ rgvolume ─ rglimiter ─ volume ─ autoaudiosink
+    ▲
+    ├── sink_0 ◀── [ uridecodebin ─ audioconvert ─ audioresample ─ capsfilter ─ queue ]   track N
+    ├── sink_1 ◀── [ uridecodebin ─ audioconvert ─ audioresample ─ capsfilter ─ queue ]   track N+1
+    └── …
+```
+
+Every track is its own **branch** feeding its own mixer pad. Two pad properties
+do all the work:
+
+- **`offset`** — where this track begins on the mixer's timeline.
+- **`volume`** — automatable from a `GstControlSource`.
+
+That single mechanism gives us everything:
+
+| Setting | What it does to the pads |
+|---|---|
+| **Gapless** | `offset(N+1) = end of N`. The tracks abut exactly. |
+| **Crossfade** | `offset(N+1) = end of N − overlap`, plus an equal-power volume envelope on each pad. |
+| **Skip silence** | The branch's probe drops the silent head/tail, so the track's *length* shrinks — and the next `offset` moves in. |
+
+Crossfade of 0 therefore collapses to exact sample-for-sample concatenation.
+There is no separate "gapless path" and "crossfade path" to keep in sync.
+
+Everything downstream of the mixer is pinned to **44.1 kHz stereo F32**. A caps
+change mid-stream resets the audio sink, which is its own source of gaps.
+
+## Silence
+
+`src/silence.rs` decodes each track to 8 kHz mono on a worker thread (cheap, and
+plenty to find an amplitude edge) and reports:
+
+```rust
+struct Trim {
+    start: u64,           // first sample of actual audio
+    end:   u64,           // one past the last
+    total: u64,           // full decoded length
+    holes: Vec<(u64,u64)>,// silent runs *inside* the music
+}
+```
+
+The threshold is **relative to each track's own peak**, not absolute. This matters
+more than it sounds: a fixed threshold reads the noise floor a lossy codec decodes
+into a "silent" run-out as *music*. Before this was fixed, a 991 ms silence was
+detected as 186 ms.
+
+### Edge silence vs interior silence are different problems
+
+**Edges are easy.** The pad probe drops buffers outside `[start, end]`. The branch
+then hits EOS early, and — because we also computed a shorter length — the *next*
+track's `offset` moves in to meet it. No seek, no glitch.
+
+**Interiors are not.** Dropping the buffers in the middle of a track achieves
+*nothing*: the mixer simply emits silence over the stretch where no buffers
+arrived. To actually close the hole, everything after it must be **pulled
+earlier**, which means rewriting timestamps in flight:
+
+```rust
+// buffers overlapping a cut: drop
+if cuts.iter().any(|(a, b)| pts < *b && pts + dur > *a) {
+    return PadProbeReturn::Drop;
+}
+// buffers past a cut: pull them earlier by everything removed before them
+let removed = cuts.iter().filter(|(_, b)| *b <= pts).map(|(a,b)| b - a).sum();
+buffer.make_mut().set_pts(ClockTime::from_nseconds(pts - removed));
+```
+
+The subtlety that cost the most time: you must drop buffers **overlapping** the
+cut, not merely those **contained** in it. A buffer straddling the edge is
+otherwise neither dropped (not fully inside) nor shifted (the cut doesn't end
+before it) — so it passes through at its *old* timestamp, and that one backwards
+jump makes `audiomixer` decide the stream is broken, resync, and **discard the
+entire rewritten timeline**. The symptom is bizarre and silent: the hole is still
+there *and* the track gets truncated.
+
+Interior silence is capped rather than removed, and runs under 400 ms are never
+touched. A four-bar rest is music; five minutes of dead air before a hidden track
+is not.
+
+## "Now playing" is derived from position, never from buffers
+
+A branch's buffers reach the mixer **as soon as the branch is created**, which can
+be *minutes* before that track is audible — the mixer holds them until the pad's
+offset comes due. So a first-buffer callback is a useless "track started" signal;
+using one made the UI display the *next* song for the whole of the current one.
+
+The honest signal is the playback position against the timeline. Since we chose
+every track's start time, this is exact:
+
+```rust
+branches.iter()
+    .filter(|b| b.start_rt <= pos)
+    .max_by_key(|b| b.start_rt)
+```
+
+`current` (what is playing) and `announced` (what the UI has been told) are
+tracked separately — otherwise the very first track looks like "no change" to the
+poller and is never announced at all.
+
+## Scheduling
+
+The next branch **must exist before the current one hits EOS**, or the mixer runs
+out of pads and ends the stream. Branches are therefore built eagerly, as soon as
+the silence analysis for the following track lands. A `followed` flag keeps
+`schedule_following()` idempotent — it is reachable from several places and would
+otherwise append the same track twice.
+
+Seeking rebuilds the timeline with the current track at its head. An explicit jump
+is allowed to be disruptive, and it keeps the pad offsets trivially correct, which
+they would not be if we seeked a timeline that already had a crossfade scheduled
+into it.
+
+---
+
+# Three approaches that failed first
+
+Recorded because all three look reasonable, and two of them would have shipped as
+bugs.
+
+### 1. `playbin` + `about-to-finish`
+
+The textbook gapless recipe, and it worked — verified sample-exact. Rejected for
+two hard limits: it plays whatever is in the file (so it cannot skip recorded
+silence — that needs a per-track segment, which the gapless handoff cannot
+express), and it cannot crossfade.
+
+### 2. `removesilence`
+
+Looks purpose-built for the job. It is **mono only** (`channels=1` in its pad
+template) — dropping it into a music pipeline either fails to negotiate or
+downmixes the audio to mono. It silently did nothing here, which is the only
+reason it didn't produce a nasty surprise.
+
+### 3. A mid-stream segment-stop seek
+
+Tell the pipeline "end this track early, where the music actually stops."
+Non-flushing, so playback isn't interrupted. `playbin` accepts it (as
+`start=SET(pos)`; `start=NONE` is rejected), and it *does* close the gap.
+
+It also **duplicates ~1 s of already-buffered audio**, because the seek re-pushes
+from the seek point while the sink's existing buffers are not discarded. Verified:
+a phase discontinuity of 1.66 rad at the seek point. It trades a gap for a worse
+artifact.

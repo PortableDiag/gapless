@@ -1,0 +1,4 @@
+# The project lives on an exfat volume, which has no POSIX file locking or
+# atomic-rename guarantees. Cargo relies on both, so builds go to ext4.
+[build]
+target-dir = "/home/null/.cache/cargo-target/gapless"
