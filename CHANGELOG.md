@@ -17,6 +17,12 @@ commit that made them.
   actually ran out. `Branch` now carries its `skip` and exposes `span()` — what
   it really occupies on the mixer timeline — and the scheduler and the fade both
   use that. Guarded by `scripts/verify-resume.sh`.
+- **The session is now saved on SIGTERM and SIGINT.** Logging out, a `kill`, or
+  `systemctl --user stop` never closes the window, so the close handler did not
+  run and your place in the track died with the process — only the 5-second
+  periodic save stood between you and losing it. A player whose whole point is
+  remembering where you were should not forget because the *session* ended rather
+  than the window.
 - **Shuffle and repeat changed over MPRIS are now saved and repaint the UI**
   (`ffdc8d6`, 2026-07-12). Toggling either mode from a lock-screen widget or
   `playerctl` set the flag on the player and nothing else: the in-app buttons
