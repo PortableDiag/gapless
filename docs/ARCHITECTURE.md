@@ -112,10 +112,32 @@ the silence analysis for the following track lands. A `followed` flag keeps
 `schedule_following()` idempotent — it is reachable from several places and would
 otherwise append the same track twice.
 
+## Seeking
+
 Seeking rebuilds the timeline with the current track at its head. An explicit jump
-is allowed to be disruptive, and it keeps the pad offsets trivially correct, which
+is allowed to be disruptive, and it keeps the pad offsets trivially correct — which
 they would not be if we seeked a timeline that already had a crossfade scheduled
 into it.
+
+The seek itself is **the same probe mechanism as everything else**: the branch is
+given the target as its `skip`, the probe drops everything before it, and the pad
+offset shifts what remains back to running time zero. There is no seek event
+anywhere in the engine.
+
+That is worth stating plainly because the first implementation did *both* — probe
+skip **and** a pipeline seek — and the two compounded. With the pad offset already
+shifted by −10 s, the extra seek to 10 s landed at 20 s, off the end of the track,
+so the branch EOSed having played nothing. A seek produced **silence**.
+
+Cost: seeking decodes and discards everything before the target. Measured at
+~0.46 s to chew through a whole 233 s MP3, so worst-case seek latency is about half
+a second and it is bounded by the track length. Cheap enough not to warrant a
+decoder seek, which would reintroduce the pad-offset interaction that caused the
+bug above.
+
+`Sched::skip` remembers how far into the song the branch was told to start, because
+the mixer timeline always begins at zero and the song does not. Without it the
+position display reads zero right after a seek.
 
 ---
 

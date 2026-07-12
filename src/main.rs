@@ -16,7 +16,13 @@ const APP_ID: &str = "com.procomputation.Gapless";
 /// How long after a user seek to ignore pipeline position reports. A flushing
 /// seek keeps reporting the *old* position for a moment; without this the
 /// slider snaps backwards under the cursor before catching up.
-const SEEK_SETTLE: Duration = Duration::from_millis(400);
+const SEEK_SETTLE: Duration = Duration::from_millis(800);
+
+/// A seek rebuilds the mixer timeline, which is far too expensive to do on every
+/// `change-value` the slider emits — and it emits a burst of them, especially
+/// when the trough is clicked rather than the handle dragged. Coalesce: remember
+/// the newest target, and only actually seek once the user has settled.
+const SEEK_DEBOUNCE: Duration = Duration::from_millis(150);
 
 struct Ui {
     cover: gtk::Image,
@@ -33,6 +39,9 @@ struct Ui {
     tracks: RefCell<Vec<Track>>,
     /// When the user last moved the seek slider. See SEEK_SETTLE.
     last_seek: Cell<Option<Instant>>,
+    /// Newest requested seek position, and the timer that will apply it.
+    seek_target: Cell<Option<u64>>,
+    seek_timer: RefCell<Option<glib::SourceId>>,
     /// Bumps on every track change so each cached cover gets a fresh filename;
     /// MPRIS clients cache art by URL and won't re-read a path they've seen.
     art_seq: Cell<u64>,
@@ -45,6 +54,15 @@ fn main() -> glib::ExitCode {
 }
 
 fn build_window(app: &adw::Application) {
+    // The desktop may have `gtk-primary-button-warps-slider` off (KDE ships it
+    // that way), which makes clicking a slider's trough page-step towards the
+    // pointer instead of jumping to it. For a seek bar that is simply wrong: you
+    // click where you want to be. Force it on for this app only.
+    if let Some(settings) = gtk::Settings::default() {
+        settings.set_gtk_primary_button_warps_slider(true);
+    }
+    gtk::Window::set_default_icon_name(APP_ID);
+
     let player = match Player::new() {
         Ok(p) => p,
         Err(e) => {
@@ -135,6 +153,8 @@ fn build_window(app: &adw::Application) {
         list,
         tracks: RefCell::new(Vec::new()),
         last_seek: Cell::new(None),
+        seek_target: Cell::new(None),
+        seek_timer: RefCell::new(None),
         art_seq: Cell::new(0),
     });
 
@@ -389,7 +409,27 @@ fn wire_up(
         let ui = ui.clone();
         move |_, _, value| {
             ui.last_seek.set(Some(Instant::now()));
-            player.seek(value.max(0.0) as u64);
+            ui.seek_target.set(Some(value.max(0.0) as u64));
+
+            // Restart the timer on every move. Dragging the handle, or clicking
+            // the trough (which page-steps repeatedly), fires this many times a
+            // second; without coalescing we would tear down and rebuild the
+            // pipeline for each one and the UI would lock solid.
+            if let Some(id) = ui.seek_timer.borrow_mut().take() {
+                id.remove();
+            }
+            let id = glib::timeout_add_local_once(SEEK_DEBOUNCE, {
+                let player = player.clone();
+                let ui = ui.clone();
+                move || {
+                    ui.seek_timer.replace(None);
+                    if let Some(target) = ui.seek_target.take() {
+                        player.seek(target);
+                    }
+                }
+            });
+            ui.seek_timer.replace(Some(id));
+
             glib::Propagation::Proceed
         }
     });
@@ -648,6 +688,9 @@ fn listen_for_events(ui: &Rc<Ui>, player: &Arc<Player>) {
                         ui.seek.set_range(0.0, dur as f64);
                         ui.seek.set_value(pos as f64);
                         ui.time_label.set_label(&format!("{} / {}", clock(pos), clock(dur)));
+                    }
+                    if let Some(m) = &mpris {
+                        mpris::publish_position(m, pos);
                     }
                 }
                 PlayerEvent::PlayingChanged(playing) => {

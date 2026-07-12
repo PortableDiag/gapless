@@ -23,6 +23,7 @@ cargo run --release --example capture -- out.wav track1.mp3 track2.mp3
 | `GAPLESS_TRIM=1` | skip silence at track edges |
 | `GAPLESS_INNER=1.0` | cap silence inside a track at 1.0 s |
 | `GAPLESS_CROSSFADE=3` | 3 s crossfade |
+| `GAPLESS_SEEK=10` | seek to 10 s and render from there |
 | `GAPLESS_REALTIME=1` | render at 1× instead of as fast as possible |
 
 `GAPLESS_REALTIME` matters more than it looks. With `sync=false` an 11-second
@@ -52,6 +53,22 @@ mp3-part1.mp3     10.031 s   <- the 31 ms is encoder padding
 
 Two MP3s must still render as exactly 20.000 s. If they don't, the padding isn't
 being stripped, and that alone will make every MP3 album click.
+
+## Testing the seek without touching the mouse
+
+`testdata/sweep.mp3` is a 20-second linear sweep, 200 Hz → 2200 Hz. Frequency
+therefore *encodes position*: `f ≈ 242 + 100·t`. Measure the pitch at the start of
+a render and you know exactly where the seek landed.
+
+```
+seek to 10 s:  rendered 10.00 s
+  output t=0.5s -> 1292 Hz  = track position 10.5 s   (expected 10.5)
+  output t=3.0s -> 1542 Hz  = track position 13.0 s   (expected 13.0)
+```
+
+This is how the "a seek plays silence" bug was found. Driving the real GUI with
+synthetic clicks is a bad idea on a machine with other work on it — and it tells
+you less.
 
 ## The three checks
 
