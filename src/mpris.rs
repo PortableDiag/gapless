@@ -97,6 +97,9 @@ pub async fn start(player: Arc<Player>) -> Option<Mpris> {
         }
     });
 
+    // Repeat and shuffle move no pipeline, so unlike the transport controls above
+    // they have nothing to drive the UI off. `Player::set_repeat` / `set_shuffle`
+    // emit ModesChanged for exactly that reason; main.rs repaints and saves.
     mpris.connect_set_loop_status({
         let player = player.clone();
         move |_, status| {
