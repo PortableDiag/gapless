@@ -24,6 +24,16 @@ const SEEK_SETTLE: Duration = Duration::from_millis(800);
 /// the newest target, and only actually seek once the user has settled.
 const SEEK_DEBOUNCE: Duration = Duration::from_millis(150);
 
+/// Settings are written whenever one changes, not only on close: the app can be
+/// killed, or quit from the terminal it was launched in, and a setting you have
+/// to set twice is a setting that isn't remembered. Debounced because dragging
+/// the volume slider emits a value per frame.
+const SAVE_DEBOUNCE: Duration = Duration::from_millis(600);
+
+/// How often the playing position is checkpointed to disk. Frequent enough that
+/// a crash costs you a few seconds, rare enough that it isn't a write per tick.
+const POSITION_SAVE_EVERY: Duration = Duration::from_secs(5);
+
 struct Ui {
     cover: gtk::Image,
     now_playing: gtk::Label,
@@ -45,6 +55,12 @@ struct Ui {
     /// Bumps on every track change so each cached cover gets a fresh filename;
     /// MPRIS clients cache art by URL and won't re-read a path they've seen.
     art_seq: Cell<u64>,
+    /// Where the last session stopped: (queue index, offset in nanoseconds).
+    /// Cued up but *not* started — a player that begins blaring on login is a
+    /// player you uninstall. Consumed by the first press of play.
+    resume: Cell<Option<(usize, u64)>>,
+    save_timer: RefCell<Option<glib::SourceId>>,
+    last_pos_save: Cell<Option<Instant>>,
 }
 
 fn main() -> glib::ExitCode {
@@ -156,6 +172,9 @@ fn build_window(app: &adw::Application) {
         seek_target: Cell::new(None),
         seek_timer: RefCell::new(None),
         art_seq: Cell::new(0),
+        resume: Cell::new(None),
+        save_timer: RefCell::new(None),
+        last_pos_save: Cell::new(None),
     });
 
     // ---- layout -------------------------------------------------------
@@ -201,7 +220,7 @@ fn build_window(app: &adw::Application) {
 
     let open_button = gtk::Button::builder().label("Open Folder…").build();
     let playlist_button = gtk::Button::builder().label("Open Playlist…").build();
-    let (prefs_button, xfade_scale, xfade_label, trim_switch) = build_prefs(&player, &saved);
+    let (prefs_button, xfade_scale, xfade_label, trim_switch) = build_prefs(&ui, &player, &saved);
 
     let header = adw::HeaderBar::new();
     header.pack_start(&open_button);
@@ -244,6 +263,7 @@ fn build_window(app: &adw::Application) {
 
     if let Some(source) = saved.valid_last_source() {
         load_source(&ui, &player, source.to_path_buf());
+        restore_last_track(&ui, &saved);
     }
 
     wire_up(&window, &ui, &player, &open_button, &playlist_button, &prev_button, &next_button, &volume);
@@ -257,6 +277,7 @@ fn build_window(app: &adw::Application) {
 /// the same complaint. Trimming removes silence that is *in the file*; crossfade
 /// overlaps the tracks instead. Crossfade at 0 is exact gapless.
 fn build_prefs(
+    ui: &Rc<Ui>,
     player: &Arc<Player>,
     saved: &Settings,
 ) -> (gtk::MenuButton, gtk::Scale, gtk::Label, gtk::Switch) {
@@ -266,8 +287,10 @@ fn build_prefs(
         .build();
     trim_switch.connect_state_set({
         let player = player.clone();
+        let ui = ui.clone();
         move |_, on| {
             player.set_trim_silence(on);
+            schedule_save(&ui, &player);
             glib::Propagation::Proceed
         }
     });
@@ -303,10 +326,12 @@ fn build_prefs(
     xfade_scale.connect_value_changed({
         let player = player.clone();
         let label = xfade_label.clone();
+        let ui = ui.clone();
         move |scale| {
             let secs = scale.value();
             player.set_crossfade((secs * 1e9) as u64);
             label.set_label(&crossfade_text(secs));
+            schedule_save(&ui, &player);
         }
     });
 
@@ -334,10 +359,12 @@ fn build_prefs(
     inner_scale.connect_value_changed({
         let player = player.clone();
         let label = inner_label.clone();
+        let ui = ui.clone();
         move |scale| {
             let secs = scale.value();
             player.set_inner_limit((secs * 1e9) as u64);
             label.set_label(&inner_text(secs));
+            schedule_save(&ui, &player);
         }
     });
     let inner_heading = gtk::Label::builder()
@@ -446,6 +473,7 @@ fn wire_up(
                 v if v < 0.67 => "audio-volume-medium-symbolic",
                 _ => "audio-volume-high-symbolic",
             }));
+            schedule_save(&ui, &player);
         }
     });
 
@@ -456,6 +484,7 @@ fn wire_up(
             let mode = player.repeat().cycle();
             player.set_repeat(mode);
             set_repeat_look(&ui, mode);
+            schedule_save(&ui, &player);
         }
     });
 
@@ -466,6 +495,7 @@ fn wire_up(
             let on = !player.shuffle();
             player.set_shuffle(on);
             set_shuffle_look(&ui, on);
+            schedule_save(&ui, &player);
         }
     });
 
@@ -516,7 +546,9 @@ fn wire_up(
 
     ui.list.connect_row_activated({
         let player = player.clone();
+        let ui = ui.clone();
         move |_, row| {
+            ui.resume.set(None);
             if let Err(e) = player.play_index(row.index() as usize) {
                 eprintln!("play failed: {e}");
             }
@@ -527,9 +559,18 @@ fn wire_up(
         let player = player.clone();
         let ui = ui.clone();
         move |_| {
-            if !player.is_loaded() && !ui.tracks.borrow().is_empty() {
-                let _ = player.play_index(0);
-                return;
+            if !player.is_loaded() {
+                // Pick up where the last session left off, if we cued something.
+                if let Some((track, offset)) = ui.resume.take() {
+                    if let Err(e) = player.play_index_at(track, offset) {
+                        eprintln!("resume failed: {e}");
+                    }
+                    return;
+                }
+                if !ui.tracks.borrow().is_empty() {
+                    let _ = player.play_index(0);
+                    return;
+                }
             }
             if let Err(e) = player.toggle_pause() {
                 eprintln!("pause failed: {e}");
@@ -642,6 +683,13 @@ fn load_source(ui: &Rc<Ui>, player: &Arc<Player>, path: PathBuf) {
 
     // Remember it even if the user never plays anything.
     let mut s = current_settings(ui, player);
+    // A resume point belongs to the source it came from. Opening a different
+    // folder abandons it rather than resuming into a coincidental path match.
+    if s.last_source.as_deref() != Some(path.as_path()) {
+        ui.resume.set(None);
+        s.last_track = None;
+        s.last_position_secs = 0.0;
+    }
     s.last_source = Some(path);
     s.save();
 }
@@ -692,12 +740,25 @@ fn listen_for_events(ui: &Rc<Ui>, player: &Arc<Player>) {
                     if let Some(m) = &mpris {
                         mpris::publish_position(m, pos);
                     }
+
+                    let due = ui
+                        .last_pos_save
+                        .get()
+                        .map(|t| t.elapsed() >= POSITION_SAVE_EVERY)
+                        .unwrap_or(true);
+                    if due && player.is_playing() {
+                        ui.last_pos_save.set(Some(Instant::now()));
+                        save_settings(&ui, &player);
+                    }
                 }
                 PlayerEvent::PlayingChanged(playing) => {
                     set_play_icon(&ui, playing);
                     if let Some(m) = &mpris {
                         mpris::publish_status(m, playing);
                     }
+                    // Pausing is the strongest signal there is that this is where
+                    // the user wants to come back to.
+                    save_settings(&ui, &player);
                 }
                 PlayerEvent::QueueFinished => {
                     set_play_icon(&ui, false);
@@ -766,8 +827,76 @@ fn current_settings(ui: &Rc<Ui>, player: &Arc<Player>) -> Settings {
     s.trim_silence = player.trim_silence();
     s.crossfade_secs = player.crossfade() as f64 / 1e9;
     s.inner_silence_secs = player.inner_limit() as f64 / 1e9;
-    let _ = ui;
+
+    // Only overwrite the resume point if something is actually loaded. Otherwise
+    // the first setting the user touches after launch would wipe the position we
+    // are holding for them.
+    if let Some(i) = player.current() {
+        if let Some(track) = ui.tracks.borrow().get(i) {
+            s.last_track = Some(track.path.clone());
+            s.last_position_secs = player.position() as f64 / 1e9;
+        }
+    } else if let Some((i, offset)) = ui.resume.get() {
+        if let Some(track) = ui.tracks.borrow().get(i) {
+            s.last_track = Some(track.path.clone());
+            s.last_position_secs = offset as f64 / 1e9;
+        }
+    }
     s
+}
+
+/// Coalesced write. Every control calls this; a volume drag would otherwise
+/// rewrite the file once per frame.
+fn schedule_save(ui: &Rc<Ui>, player: &Arc<Player>) {
+    if let Some(id) = ui.save_timer.borrow_mut().take() {
+        id.remove();
+    }
+    let id = glib::timeout_add_local_once(SAVE_DEBOUNCE, {
+        let ui = ui.clone();
+        let player = player.clone();
+        move || {
+            ui.save_timer.replace(None);
+            save_settings(&ui, &player);
+        }
+    });
+    ui.save_timer.replace(Some(id));
+}
+
+/// Cue up the track the last session was playing, at the position it reached —
+/// but do not start it. Matched by path, so a rescan that renumbers the queue
+/// still lands on the right song, and a track that has since been deleted simply
+/// doesn't resume.
+fn restore_last_track(ui: &Rc<Ui>, saved: &Settings) {
+    let Some(want) = saved.last_track.as_deref() else { return };
+    let found = ui
+        .tracks
+        .borrow()
+        .iter()
+        .position(|t| t.path == want)
+        .map(|i| (i, ui.tracks.borrow()[i].clone()));
+    let Some((i, track)) = found else { return };
+
+    let mut pos = (saved.last_position_secs.max(0.0) * 1e9) as u64;
+    // Resuming three seconds from the end of a song is not resuming, it is an
+    // immediate track change. Treat the tail as "finished" and start it over.
+    if track.duration_nanos > 0 && pos + 3_000_000_000 >= track.duration_nanos {
+        pos = 0;
+    }
+
+    ui.resume.set(Some((i, pos)));
+    ui.now_playing.set_label(&track.title);
+    ui.now_artist.set_label(&format!("{} — {}", track.artist, track.album));
+    ui.now_detail.set_label(&detail_line(&track));
+    show_cover(ui, &track);
+    if let Some(row) = ui.list.row_at_index(i as i32) {
+        ui.list.select_row(Some(&row));
+    }
+    if track.duration_nanos > 0 {
+        ui.seek.set_range(0.0, track.duration_nanos as f64);
+        ui.seek.set_value(pos as f64);
+        ui.time_label
+            .set_label(&format!("{} / {}", clock(pos), clock(track.duration_nanos)));
+    }
 }
 
 fn save_settings(ui: &Rc<Ui>, player: &Arc<Player>) {

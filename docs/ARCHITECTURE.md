@@ -139,6 +139,28 @@ bug above.
 the mixer timeline always begins at zero and the song does not. Without it the
 position display reads zero right after a seek.
 
+## Session state
+
+`~/.config/gapless/state.json`, written **whenever a setting changes** rather than
+only on close. Saving on `close-request` alone looks fine and isn't: the app can be
+killed, or quit with Ctrl-C in the terminal it was launched from, and a setting you
+have to set twice is a setting that isn't remembered. Writes are debounced 600 ms,
+because a volume drag emits a value per frame.
+
+The playing position is checkpointed every 5 s, and on every pause — pausing is the
+strongest available signal that this is where the user wants to come back to.
+
+The resume point is stored as a **path, not an index**. A folder rescan or an edited
+playlist renumbers the queue, and resuming into whatever track happens to sit at
+index 12 today is worse than not resuming at all. On startup the path is looked up
+in the freshly-loaded queue; if it isn't there (deleted, unmounted, different
+source), the session simply doesn't resume.
+
+Restoring **cues the track up without starting it** — `resume` holds `(index,
+offset)` and the first press of play consumes it via `play_index_at`, which is the
+same `start_at` path as a seek. A music player that begins blaring on login is a
+music player you uninstall.
+
 ---
 
 # Three approaches that failed first

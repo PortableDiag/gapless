@@ -45,7 +45,8 @@ both, and can crossfade instead if you'd rather.
 - Repeat off/all/one, shuffle, ReplayGain, MPRIS2 (media keys + lock screen).
 - M3U/M3U8/PLS playlists, **in playlist order**.
 - Album art, per-track detail (year, genre, codec, sample rate, bit depth).
-- Remembers your last folder or playlist and every setting.
+- **Resumes your session** — folder or playlist, volume, shuffle, repeat, and the
+  track and position you stopped at. Cued up, not auto-played.
 
 ## Install
 

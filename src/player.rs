@@ -359,6 +359,12 @@ impl Player {
         self.start_at(track, 0)
     }
 
+    /// Start a track part-way in. Resuming last session's position is the same
+    /// operation as seeking, so it goes through the same code path.
+    pub fn play_index_at(&self, track: usize, offset: u64) -> Result<()> {
+        self.start_at(track, offset)
+    }
+
     fn start_at(&self, track: usize, offset: u64) -> Result<()> {
         {
             let q = self.queue.lock().unwrap();
