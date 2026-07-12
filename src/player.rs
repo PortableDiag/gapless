@@ -142,8 +142,14 @@ struct Branch {
     pad: gst::Pad,
     /// Where this track begins on the mixer timeline.
     start_rt: u64,
-    /// Audible length, silence excluded. None until the analysis lands.
+    /// Audible length of the *whole* track, silence excluded. None until the
+    /// analysis lands. This is the song's length — what the seek bar shows — and
+    /// is **not** what this branch occupies on the timeline when it was resumed
+    /// part-way in. For that, see `span`.
     len: Option<u64>,
+    /// How far into the track this branch was told to start: 0 normally, the
+    /// resume or seek offset otherwise.
+    skip: u64,
     trim: Arc<Mutex<Option<Trim>>>,
     started: Arc<AtomicBool>,
     /// Snapshot of the trim setting when this branch was built. The probe obeys
@@ -155,6 +161,18 @@ struct Branch {
     /// `schedule_following` can be reached from several places; without this it
     /// happily appends the same next track twice.
     followed: bool,
+}
+
+impl Branch {
+    /// How much time this branch really occupies on the mixer timeline. A branch
+    /// resumed 227 s into a 300 s song only plays the 73 s that are left, even
+    /// though the *song* is still 300 s long — and it is this number, not the
+    /// song's length, that says when the next track must start and where the
+    /// fade-out belongs. Confusing the two schedules the follower minutes into
+    /// the future: dead air, no advance, no crossfade.
+    fn span(&self) -> Option<u64> {
+        self.len.map(|len| len.saturating_sub(self.skip))
+    }
 }
 
 #[derive(Default)]
@@ -660,11 +678,13 @@ impl Player {
             cuts,
         );
 
-        let len = trim
+        // The fade goes on what this branch will actually play. Resumed part-way
+        // in, that is the remainder — not the length of the song.
+        let full = trim
             .as_ref()
             .map(|t| Self::effective_len(t, trim_on, inner))
             .unwrap_or_else(|| self.track_duration(track));
-        self.apply_fade(&pad, start_rt, len);
+        self.apply_fade(&pad, start_rt, full.saturating_sub(skip));
 
         self.sched.lock().unwrap().branches.push(Branch {
             slot,
@@ -673,6 +693,7 @@ impl Player {
             pad,
             start_rt,
             len: trim.as_ref().map(|t| Self::effective_len(t, trim_on, inner)),
+            skip,
             trim: trim_cell,
             started,
             trim_on,
@@ -812,7 +833,7 @@ impl Player {
                 let is_current =
                     b.started.load(Ordering::SeqCst) || (!any_started && i == 0);
                 if is_current {
-                    keep.push((b.pad.clone(), b.start_rt, b.len));
+                    keep.push((b.pad.clone(), b.start_rt, b.span()));
                 } else {
                     doomed.push(b.slot);
                 }
@@ -827,9 +848,9 @@ impl Player {
         if let Some(b) = self.sched.lock().unwrap().branches.last_mut() {
             b.followed = false;
         }
-        for (pad, start_rt, len) in keep {
-            if let Some(len) = len {
-                self.apply_fade(&pad, start_rt, len);
+        for (pad, start_rt, span) in keep {
+            if let Some(span) = span {
+                self.apply_fade(&pad, start_rt, span);
             }
         }
         self.schedule_following();
@@ -893,11 +914,11 @@ impl Player {
     /// Once we know how long the last scheduled track really is, we know when the
     /// one after it should start — and can build it.
     fn schedule_following(&self) {
-        let (last_track, last_start, last_len) = {
+        let (last_track, last_start, last_span) = {
             let s = self.sched.lock().unwrap();
             match s.branches.last() {
-                Some(b) if !b.followed => match b.len {
-                    Some(len) => (b.track, b.start_rt, len),
+                Some(b) if !b.followed => match b.span() {
+                    Some(span) => (b.track, b.start_rt, span),
                     None => return, // analysis still pending
                 },
                 _ => return,
@@ -915,8 +936,8 @@ impl Player {
             return;
         };
 
-        let xf = self.crossfade.load(Ordering::SeqCst).min(last_len / 2);
-        let start_rt = last_start + last_len.saturating_sub(xf);
+        let xf = self.crossfade.load(Ordering::SeqCst).min(last_span / 2);
+        let start_rt = last_start + last_span.saturating_sub(xf);
 
         if let Some(b) = self.sched.lock().unwrap().branches.last_mut() {
             b.followed = true;
@@ -930,13 +951,13 @@ impl Player {
     /// mixer timeline. This is exact — we chose every branch's start time — and,
     /// unlike a first-buffer callback, it is not fooled by the mixer buffering a
     /// track's data long before that track is due.
-    fn current_at(&self, pos: u64) -> Option<(usize, u64, u64)> {
+    fn current_at(&self, pos: u64) -> Option<(usize, u64, u64, u64)> {
         let s = self.sched.lock().unwrap();
         s.branches
             .iter()
             .filter(|b| b.start_rt <= pos)
             .max_by_key(|b| b.start_rt)
-            .map(|b| (b.track, b.start_rt, b.len.unwrap_or(0)))
+            .map(|b| (b.track, b.start_rt, b.len.unwrap_or(0), b.skip))
     }
 
     fn pump_internal(self: &Arc<Self>, irx: async_channel::Receiver<Internal>) {
@@ -954,6 +975,7 @@ impl Player {
                         }
 
                         let inner = player.inner_limit_opt();
+                        let mut refade: Vec<(gst::Pad, u64, u64)> = Vec::new();
                         {
                             let mut s = player.sched.lock().unwrap();
                             s.analyzing.remove(&track);
@@ -972,14 +994,23 @@ impl Player {
                                     trim.clone()
                                 };
                                 *b.trim.lock().unwrap() = Some(effective.clone());
-                                b.len = Some(Player::effective_len(&effective, b.trim_on, inner));
+                                let len = Player::effective_len(&effective, b.trim_on, inner);
+                                b.len = Some(len);
+                                // The fade was written against a guess at the length
+                                // (the container's duration). Now that the real one is
+                                // known, redo it against the span this branch will
+                                // actually play.
+                                refade.push((b.pad.clone(), b.start_rt, len.saturating_sub(b.skip)));
                                 if Some(b.track) == current {
-                                    current_len = Some(Player::effective_len(&effective, b.trim_on, inner));
+                                    current_len = Some(len);
                                 }
                             }
                             if let Some(len) = current_len {
                                 s.current_len = len;
                             }
+                        }
+                        for (pad, start_rt, span) in refade {
+                            player.apply_fade(&pad, start_rt, span);
                         }
                         player.schedule_following();
                     }
@@ -1017,13 +1048,17 @@ impl Player {
                 .map(|t| t.nseconds())
                 .unwrap_or(0);
 
-            if let Some((track, start_rt, len)) = player.current_at(global) {
+            if let Some((track, start_rt, len, skip)) = player.current_at(global) {
                 let changed = {
                     let mut s = player.sched.lock().unwrap();
                     let changed = s.announced != Some(track);
                     s.current = Some(track);
                     s.announced = Some(track);
                     s.current_start = start_rt;
+                    // Follow the branch's own skip. Without this, advancing off a
+                    // resumed track leaves the old resume offset in place and every
+                    // position after it reads that much too high.
+                    s.skip = skip;
                     s.current_len = if len > 0 { len } else { 0 };
                     changed
                 };

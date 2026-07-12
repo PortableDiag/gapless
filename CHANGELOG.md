@@ -9,6 +9,14 @@ commit that made them.
 
 ### Fixed
 
+- **A resumed track now hands off to the next one.** After resuming a saved
+  session, the track played to its end and then stopped dead — no advance, no
+  repeat, no shuffle, no crossfade. A branch's length was the length of the whole
+  *song*, even when it had been told to start 227 s in and would only play the
+  remainder, so the follow-on track was scheduled minutes after the audio
+  actually ran out. `Branch` now carries its `skip` and exposes `span()` — what
+  it really occupies on the mixer timeline — and the scheduler and the fade both
+  use that. Guarded by `scripts/verify-resume.sh`.
 - **Shuffle and repeat changed over MPRIS are now saved and repaint the UI**
   (`ffdc8d6`, 2026-07-12). Toggling either mode from a lock-screen widget or
   `playerctl` set the flag on the player and nothing else: the in-app buttons
@@ -24,15 +32,10 @@ commit that made them.
 - `scripts/verify-mpris-modes.sh` — proves an MPRIS-only mode change survives a
   `SIGKILL`, on a private D-Bus session and config dir so a running desktop copy
   of Gapless is neither disturbed nor accidentally driven.
-- `docs/SESSION-2026-07-12.md` — session report, including the open crossfade bug
-  and the experiments that came back negative.
-
-### Known issues
-
-- **Crossfade does not audibly apply in the running app.** The value is saved
-  correctly and the engine honours it when rendered through `examples/capture`
-  (with trimming on or off), so the fault is app-side — most likely the
-  startup/resume path. See `docs/SESSION-2026-07-12.md` §7.
+- `scripts/verify-resume.sh` — resuming part-way into a track must still hand off
+  to the next one, with the crossfade landing where the audio actually ends.
+- `docs/SESSION-2026-07-12.md` — session report, including how the resume bug
+  managed to imitate a no-op and fool the first round of measurements.
 
 ## 2026-07-11
 

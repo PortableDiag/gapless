@@ -90,9 +90,12 @@ real library (ADM)      1064 ms gap at the join  ->  0 ms
 See **[docs/VERIFICATION.md](docs/VERIFICATION.md)** for how and why, including
 why the obvious way to test this is wrong.
 
-Session state gets the same treatment — `./scripts/verify-mpris-modes.sh` changes
-shuffle and repeat *over D-Bus only*, then `SIGKILL`s the app, because a clean
-close would save on its way out and hide the bug being tested.
+Two more checks, each written after a real bug got past the ones above:
+
+```sh
+./scripts/verify-resume.sh       # a track resumed part-way in must still hand off
+./scripts/verify-mpris-modes.sh  # a mode set over D-Bus must survive a SIGKILL
+```
 
 ## Documentation
 
@@ -109,7 +112,6 @@ close would save on its way out and hide the bug being tested.
 Playback is solid. Not yet done: no database (the library is rescanned on each
 open), no search, no queue editing, no folder.jpg cover fallback.
 
-**Known bug:** crossfade does not audibly apply in the running app, though it
-saves correctly and the engine honours it when rendered through
-`examples/capture`. See [docs/SESSION-2026-07-12.md](docs/SESSION-2026-07-12.md)
-§7 for the evidence so far.
+Note that **Next is a hard cut, deliberately** — it tears the mixer timeline down
+and starts the new track at once. Crossfade applies to the track that follows
+naturally, not to a skip.
