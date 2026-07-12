@@ -270,6 +270,7 @@ fn build_window(app: &adw::Application) {
     wire_up(&window, &ui, &player, &open_button, &playlist_button, &prev_button, &next_button, &volume);
     listen_for_events(&ui, &player);
     persist_on_close(&window, &ui, &player);
+    persist_on_signal(app, &ui, &player);
 
     window.present();
 }
@@ -953,6 +954,30 @@ fn restore_last_track(ui: &Rc<Ui>, saved: &Settings) {
 
 fn save_settings(ui: &Rc<Ui>, player: &Arc<Player>) {
     current_settings(ui, player).save();
+}
+
+/// Logging out, `systemctl --user stop`, or a plain `kill` sends SIGTERM, and
+/// Ctrl-C sends SIGINT. Neither closes the window, so `persist_on_close` never
+/// runs and the resume point dies with the process — the periodic save is the
+/// only thing standing between the user and losing their place. A player whose
+/// whole point is to remember where you were should not lose it because the
+/// session ended rather than the window did.
+fn persist_on_signal(app: &adw::Application, ui: &Rc<Ui>, player: &Arc<Player>) {
+    const SIGINT: i32 = 2;
+    const SIGTERM: i32 = 15;
+
+    for sig in [SIGINT, SIGTERM] {
+        glib::unix_signal_add_local(sig, {
+            let app = app.clone();
+            let ui = ui.clone();
+            let player = player.clone();
+            move || {
+                save_settings(&ui, &player);
+                app.quit();
+                glib::ControlFlow::Break
+            }
+        });
+    }
 }
 
 fn persist_on_close(window: &adw::ApplicationWindow, ui: &Rc<Ui>, player: &Arc<Player>) {
