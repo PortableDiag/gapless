@@ -42,7 +42,9 @@ both, and can crossfade instead if you'd rather.
 - **Cap silence inside a track** — for long pauses and hidden tracks buried in
   dead air. A cap, not a switch: a four-bar rest is music.
 - **Crossfade, 0–10 s** — Winamp-style, equal-power.
-- Repeat off/all/one, shuffle, ReplayGain, MPRIS2 (media keys + lock screen).
+- Repeat off/all/one, shuffle, ReplayGain, MPRIS2 (media keys + lock screen) —
+  and a mode toggled from the lock screen or `playerctl` repaints the buttons and
+  is saved, exactly as a click on them would be.
 - M3U/M3U8/PLS playlists, **in playlist order**.
 - Album art, per-track detail (year, genre, codec, sample rate, bit depth).
 - **Resumes your session** — folder or playlist, volume, shuffle, repeat, and the
@@ -88,6 +90,10 @@ real library (ADM)      1064 ms gap at the join  ->  0 ms
 See **[docs/VERIFICATION.md](docs/VERIFICATION.md)** for how and why, including
 why the obvious way to test this is wrong.
 
+Session state gets the same treatment — `./scripts/verify-mpris-modes.sh` changes
+shuffle and repeat *over D-Bus only*, then `SIGKILL`s the app, because a clean
+close would save on its way out and hide the bug being tested.
+
 ## Documentation
 
 | | |
@@ -95,8 +101,15 @@ why the obvious way to test this is wrong.
 | **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** | How the engine works, and the three approaches that failed first |
 | **[docs/VERIFICATION.md](docs/VERIFICATION.md)** | How the gapless claim is proved rather than asserted |
 | **[docs/DEVELOPING.md](docs/DEVELOPING.md)** | Layout, the tools in `examples/`, gotchas |
+| **[docs/SESSION-2026-07-12.md](docs/SESSION-2026-07-12.md)** | Latest session: the MPRIS mode-persistence fix, and the open crossfade bug |
+| **[CHANGELOG.md](CHANGELOG.md)** | What changed, when |
 
 ## Status
 
 Playback is solid. Not yet done: no database (the library is rescanned on each
 open), no search, no queue editing, no folder.jpg cover fallback.
+
+**Known bug:** crossfade does not audibly apply in the running app, though it
+saves correctly and the engine honours it when rendered through
+`examples/capture`. See [docs/SESSION-2026-07-12.md](docs/SESSION-2026-07-12.md)
+§7 for the evidence so far.
