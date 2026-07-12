@@ -1,4 +1,5 @@
 use adw::prelude::*;
+use gapless::autostart;
 use gapless::library::{self, Track};
 use gapless::playlist;
 use gapless::player::{Player, PlayerEvent, QueuedTrack, Repeat};
@@ -373,6 +374,44 @@ fn build_prefs(
         .css_classes(["heading"])
         .build();
 
+    // Whether we launch at login is the *file's* business, not state.json's —
+    // see src/autostart.rs. So the switch reads its initial state from disk.
+    let login_switch = gtk::Switch::builder()
+        .active(autostart::is_enabled())
+        .valign(gtk::Align::Center)
+        .build();
+    let login_note = gtk::Label::builder()
+        .label(login_hint(autostart::is_enabled()))
+        .xalign(0.0)
+        .wrap(true)
+        .css_classes(["dim-label", "caption"])
+        .build();
+    login_switch.connect_state_set({
+        let note = login_note.clone();
+        move |sw, on| {
+            match autostart::set(on) {
+                Ok(()) => note.set_label(login_hint(on)),
+                Err(e) => {
+                    // Don't leave the switch showing a state we failed to reach.
+                    eprintln!("autostart: {e}");
+                    note.set_label(&format!("Could not change this: {e}"));
+                    sw.set_state(!on);
+                    return glib::Propagation::Stop;
+                }
+            }
+            glib::Propagation::Proceed
+        }
+    });
+
+    let login_row = gtk::Box::builder().spacing(12).build();
+    let login_text = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    let l1 = gtk::Label::builder().label("Start Gapless when I log in").xalign(0.0).build();
+    login_text.append(&l1);
+    login_text.append(&login_note);
+    login_text.set_hexpand(true);
+    login_row.append(&login_text);
+    login_row.append(&login_switch);
+
     let content = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .spacing(8)
@@ -390,6 +429,8 @@ fn build_prefs(
     content.append(&inner_heading);
     content.append(&inner_scale);
     content.append(&inner_label);
+    content.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+    content.append(&login_row);
 
     let popover = gtk::Popover::builder().child(&content).build();
     let button = gtk::MenuButton::builder()
@@ -399,6 +440,16 @@ fn build_prefs(
         .build();
 
     (button, xfade_scale, xfade_label, trim_switch)
+}
+
+fn login_hint(on: bool) -> &'static str {
+    if on {
+        // It restores the queue and cues the track up, but does not start it —
+        // same as any other launch. Say so, so nobody expects music at login.
+        "Opens on login with your queue restored, paused"
+    } else {
+        "Off — launch it yourself"
+    }
 }
 
 fn inner_text(secs: f64) -> String {

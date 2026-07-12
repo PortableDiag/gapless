@@ -47,6 +47,8 @@ both, and can crossfade instead if you'd rather.
 - Album art, per-track detail (year, genre, codec, sample rate, bit depth).
 - **Resumes your session** — folder or playlist, volume, shuffle, repeat, and the
   track and position you stopped at. Cued up, not auto-played.
+- **Start at login** — a switch in the settings popover, no fiddling with
+  `~/.config/autostart` by hand.
 
 ## Install
 

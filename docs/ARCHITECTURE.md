@@ -161,6 +161,27 @@ offset)` and the first press of play consumes it via `play_index_at`, which is t
 same `start_at` path as a seek. A music player that begins blaring on login is a
 music player you uninstall.
 
+## Start at login
+
+An XDG autostart entry at `~/.config/autostart/com.procomputation.Gapless.desktop`,
+written by `src/autostart.rs`.
+
+**The file is the state.** There is deliberately no `autostart` flag in
+`state.json`: the desktop's own startup-applications panel writes that same file,
+so a second copy of the truth would drift the moment the user touched it there,
+and the switch would then confidently show the wrong thing. `is_enabled()` reads
+the file, and honours `Hidden=true` / `X-GNOME-Autostart-enabled=false`, which is
+how a desktop usually *disables* an entry rather than deleting it.
+
+`Exec` points at `~/.local/bin/gapless` — the copy `scripts/install.sh` puts
+there — in preference to the running binary. The running binary is very often
+`~/.cache/cargo-target/gapless/release/gapless`, and baking a *cache* path into a
+login hook yields an autostart that silently stops working the first time someone
+runs `cargo clean`. That is worse than one that never worked at all.
+
+Launching at login restores the queue and cues the track up **paused**, exactly as
+a manual launch does.
+
 ---
 
 # Three approaches that failed first
