@@ -163,6 +163,9 @@ struct Sched {
     announced: Option<usize>,
     current_start: u64,
     current_len: u64,
+    /// How far into the track the current branch was told to start. The mixer
+    /// timeline always begins at zero; the song does not.
+    skip: u64,
     next_slot: u64,
     /// Tracks with an analysis in flight, so we never decode the same file twice.
     analyzing: HashSet<usize>,
@@ -188,7 +191,6 @@ pub struct Player {
     inner_limit: Arc<AtomicU64>,
     tx: async_channel::Sender<PlayerEvent>,
     itx: async_channel::Sender<Internal>,
-    pending_seek: Arc<Mutex<Option<u64>>>,
     pub events: async_channel::Receiver<PlayerEvent>,
     _bus_watch: gst::bus::BusWatchGuard,
 }
@@ -241,8 +243,7 @@ impl Player {
             shuffle: false,
         }));
 
-        let pending_seek = Arc::new(Mutex::new(None));
-        let bus_watch = watch_bus(&pipeline, tx.clone(), pending_seek.clone())?;
+        let bus_watch = watch_bus(&pipeline, tx.clone())?;
 
         let player = Arc::new(Player {
             pipeline,
@@ -256,7 +257,6 @@ impl Player {
             inner_limit: Arc::new(AtomicU64::new(0)),
             tx,
             itx,
-            pending_seek,
             events,
             _bus_watch: bus_watch,
         });
@@ -376,12 +376,18 @@ impl Player {
             s.announced = None;
             s.current_start = 0;
             s.current_len = 0;
+            s.skip = 0;
             s.finished = false;
         }
 
         // The trim may not be known yet. The probe reads it from a shared cell on
         // every buffer, so an analysis that lands after playback has begun still
         // takes effect on the track's tail — the part that actually matters.
+        // `offset` is handed to the branch as its skip: the probe drops everything
+        // before it and the pad offset shifts what remains back to running time 0.
+        // That IS the seek. Do NOT also fire a pipeline seek — the pad offset is
+        // already shifted, so the second seek lands `offset` further on again, off
+        // the end of the track, and the branch EOSes with nothing played.
         let trim = self.cached_trim(track);
         self.add_branch(track, 0, trim, offset)?;
         self.request_analysis(track);
@@ -391,9 +397,10 @@ impl Player {
         // branch ends, and the queue stops dead.
         self.schedule_following();
 
-        if offset > 0 {
-            *self.pending_seek.lock().unwrap() = Some(offset);
-        }
+        // Where we actually are in the track, for the position display: the branch
+        // renders from running time 0, but that instant is `offset` into the song.
+        self.sched.lock().unwrap().skip = offset;
+
         self.pipeline.set_state(gst::State::Playing)?;
         Ok(())
     }
@@ -501,7 +508,7 @@ impl Player {
             .map(|t| t.nseconds())
             .unwrap_or(0);
         let s = self.sched.lock().unwrap();
-        global.saturating_sub(s.current_start)
+        global.saturating_sub(s.current_start) + s.skip
     }
 
     // ---- branches ----------------------------------------------------
@@ -1006,13 +1013,10 @@ impl Player {
                 }
             }
 
-            let (dur, start) = {
-                let s = player.sched.lock().unwrap();
-                (s.current_len, s.current_start)
-            };
+            let dur = player.sched.lock().unwrap().current_len;
             if dur > 0 {
                 let _ = player.tx.send_blocking(PlayerEvent::Position {
-                    pos: global.saturating_sub(start).min(dur),
+                    pos: player.position().min(dur),
                     dur,
                 });
             }
@@ -1072,7 +1076,6 @@ fn build_branch(path: &Path) -> Result<(gst::Bin, gst::Pad)> {
 fn watch_bus(
     pipeline: &gst::Pipeline,
     tx: async_channel::Sender<PlayerEvent>,
-    pending_seek: Arc<Mutex<Option<u64>>>,
 ) -> Result<gst::bus::BusWatchGuard> {
     let bus = pipeline.bus().ok_or_else(|| anyhow!("pipeline has no bus"))?;
     let weak = pipeline.downgrade();
@@ -1080,16 +1083,6 @@ fn watch_bus(
     let guard = bus.add_watch_local(move |_, msg| {
         use gst::MessageView;
         match msg.view() {
-            // A seek asked for before the pipeline had prerolled: honour it now.
-            MessageView::AsyncDone(_) => {
-                let target = pending_seek.lock().unwrap().take();
-                if let (Some(target), Some(pipeline)) = (target, weak.upgrade()) {
-                    let _ = pipeline.seek_simple(
-                        gst::SeekFlags::FLUSH | gst::SeekFlags::ACCURATE,
-                        gst::ClockTime::from_nseconds(target),
-                    );
-                }
-            }
             MessageView::StateChanged(s) => {
                 if let Some(pipeline) = weak.upgrade() {
                     if s.src() == Some(pipeline.upcast_ref()) {

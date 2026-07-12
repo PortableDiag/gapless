@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=Gapless
+GenericName=Music Player
+Comment=Music player with true gapless playback, silence trimming and crossfade
+Exec=gapless
+Icon=com.procomputation.Gapless
+Terminal=false
+Categories=AudioVideo;Audio;Player;GTK;
+Keywords=music;audio;player;gapless;crossfade;
+StartupNotify=true
+StartupWMClass=gapless
+MimeType=audio/mpeg;audio/flac;audio/ogg;audio/x-vorbis+ogg;audio/mp4;audio/x-m4a;audio/x-wav;audio/x-opus+ogg;application/x-mpegurl;audio/x-mpegurl;audio/x-scpls;

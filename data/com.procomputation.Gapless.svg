@@ -1,0 +1,46 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#3a4a63"/>
+      <stop offset="1" stop-color="#1c2331"/>
+    </linearGradient>
+    <linearGradient id="waveA" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#5bc8ff"/>
+      <stop offset="1" stop-color="#4aa8f0"/>
+    </linearGradient>
+    <linearGradient id="waveB" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#7ee6a8"/>
+      <stop offset="1" stop-color="#4ad991"/>
+    </linearGradient>
+  </defs>
+
+  <rect x="4" y="4" width="120" height="120" rx="27" fill="url(#bg)"/>
+  <rect x="4.5" y="4.5" width="119" height="119" rx="26.5" fill="none"
+        stroke="#ffffff" stroke-opacity="0.10" stroke-width="1"/>
+
+  <!-- Two tracks meeting at the centre seam with no gap between them: the whole
+       point of the app. Bars are continuous across x=64; the only thing that
+       changes is the colour. -->
+  <g>
+    <!-- track one -->
+    <g fill="url(#waveA)">
+      <rect x="18" y="58" width="6" height="12" rx="3"/>
+      <rect x="28" y="48" width="6" height="32" rx="3"/>
+      <rect x="38" y="38" width="6" height="52" rx="3"/>
+      <rect x="48" y="46" width="6" height="36" rx="3"/>
+      <rect x="58" y="34" width="6" height="60" rx="3"/>
+    </g>
+    <!-- track two — starts exactly where track one ended -->
+    <g fill="url(#waveB)">
+      <rect x="68" y="42" width="6" height="44" rx="3"/>
+      <rect x="78" y="30" width="6" height="68" rx="3"/>
+      <rect x="88" y="44" width="6" height="40" rx="3"/>
+      <rect x="98" y="52" width="6" height="24" rx="3"/>
+      <rect x="108" y="60" width="6" height="8" rx="3"/>
+    </g>
+  </g>
+
+  <!-- the seam: no space, no silence -->
+  <line x1="64" y1="22" x2="64" y2="106" stroke="#ffffff" stroke-opacity="0.28"
+        stroke-width="1.5" stroke-dasharray="3 4"/>
+</svg>

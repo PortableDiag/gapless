@@ -95,6 +95,14 @@ fn main() -> Result<()> {
     });
 
     player.play_index(0)?;
+
+    // GAPLESS_SEEK=<seconds>: exercise the real seek path headlessly. The render
+    // should then begin at that point in the track, not at the start.
+    if let Some(secs) = std::env::var("GAPLESS_SEEK").ok().and_then(|v| v.parse::<f64>().ok()) {
+        eprintln!("  (seeking to {secs:.1}s)");
+        player.seek((secs * 1e9) as u64);
+    }
+
     main_loop.run();
 
     // Let the pipeline flush the WAV header's final size fields.

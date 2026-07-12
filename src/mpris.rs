@@ -162,6 +162,22 @@ pub fn publish_track(mpris: &Mpris, index: usize, track: &Track, art: Option<&Pa
     });
 }
 
+/// Without this the lock-screen widget shows a track with no progress at all —
+/// MPRIS serves `Position` from what we last told it, and we were telling it
+/// nothing.
+pub fn publish_position(mpris: &Mpris, nanos: u64) {
+    mpris.set_position(Time::from_nanos(nanos as i64));
+}
+
+/// Tells clients the position jumped, rather than letting them extrapolate from
+/// a stale one.
+pub fn publish_seeked(mpris: &Mpris, nanos: u64) {
+    let mpris = mpris.clone();
+    glib::spawn_future_local(async move {
+        let _ = mpris.seeked(Time::from_nanos(nanos as i64)).await;
+    });
+}
+
 pub fn publish_status(mpris: &Mpris, playing: bool) {
     let status = if playing {
         PlaybackStatus::Playing
