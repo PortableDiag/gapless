@@ -44,6 +44,10 @@ pub enum PlayerEvent {
     TrackStarted(usize),
     Position { pos: u64, dur: u64 },
     PlayingChanged(bool),
+    /// Repeat or shuffle changed. Unlike the transport events these do not move
+    /// the pipeline, so nothing else would tell the UI they happened — and they
+    /// can originate from MPRIS as easily as from a button.
+    ModesChanged { repeat: Repeat, shuffle: bool },
     QueueFinished,
     Error(String),
 }
@@ -275,7 +279,12 @@ impl Player {
     }
 
     pub fn set_repeat(&self, repeat: Repeat) {
-        self.queue.lock().unwrap().repeat = repeat;
+        let shuffle = {
+            let mut q = self.queue.lock().unwrap();
+            q.repeat = repeat;
+            q.shuffle
+        };
+        self.emit_modes(repeat, shuffle);
     }
 
     pub fn repeat(&self) -> Repeat {
@@ -284,9 +293,19 @@ impl Player {
 
     pub fn set_shuffle(&self, shuffle: bool) {
         let keep = self.sched.lock().unwrap().current;
-        let mut q = self.queue.lock().unwrap();
-        q.shuffle = shuffle;
-        q.reorder(keep);
+        let repeat = {
+            let mut q = self.queue.lock().unwrap();
+            q.shuffle = shuffle;
+            q.reorder(keep);
+            q.repeat
+        };
+        self.emit_modes(repeat, shuffle);
+    }
+
+    /// Callers are on the GTK main thread and the channel is unbounded, so this
+    /// cannot block; a closed channel just means we are shutting down.
+    fn emit_modes(&self, repeat: Repeat, shuffle: bool) {
+        let _ = self.tx.try_send(PlayerEvent::ModesChanged { repeat, shuffle });
     }
 
     pub fn shuffle(&self) -> bool {

@@ -528,26 +528,17 @@ fn wire_up(
         }
     });
 
+    // Both of these only set the mode: the resulting ModesChanged event is what
+    // repaints the button, republishes to MPRIS, and saves — the same path an
+    // MPRIS-originated change takes.
     ui.repeat_button.connect_clicked({
         let player = player.clone();
-        let ui = ui.clone();
-        move |_| {
-            let mode = player.repeat().cycle();
-            player.set_repeat(mode);
-            set_repeat_look(&ui, mode);
-            schedule_save(&ui, &player);
-        }
+        move |_| player.set_repeat(player.repeat().cycle())
     });
 
     ui.shuffle_button.connect_clicked({
         let player = player.clone();
-        let ui = ui.clone();
-        move |_| {
-            let on = !player.shuffle();
-            player.set_shuffle(on);
-            set_shuffle_look(&ui, on);
-            schedule_save(&ui, &player);
-        }
+        move |_| player.set_shuffle(!player.shuffle())
     });
 
     open_button.connect_clicked({
@@ -810,6 +801,16 @@ fn listen_for_events(ui: &Rc<Ui>, player: &Arc<Player>) {
                     // Pausing is the strongest signal there is that this is where
                     // the user wants to come back to.
                     save_settings(&ui, &player);
+                }
+                PlayerEvent::ModesChanged { repeat, shuffle } => {
+                    set_repeat_look(&ui, repeat);
+                    set_shuffle_look(&ui, shuffle);
+                    // Echo back to MPRIS so a lock-screen widget that did not
+                    // originate the change still sees it.
+                    if let Some(m) = &mpris {
+                        mpris::publish_modes(m, repeat, shuffle);
+                    }
+                    schedule_save(&ui, &player);
                 }
                 PlayerEvent::QueueFinished => {
                     set_play_icon(&ui, false);
