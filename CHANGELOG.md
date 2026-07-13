@@ -2,10 +2,10 @@
 
 All notable changes to Gapless. Newest first.
 
-The project is pre-1.0 and unreleased; entries are grouped by date and carry the
-commit that made them.
+The project is pre-1.0; entries are grouped by release and carry the commit
+that made them.
 
-## Unreleased
+## v0.1.1 — 2026-07-13
 
 ### Fixed
 
@@ -43,7 +43,7 @@ commit that made them.
 - `docs/SESSION-2026-07-12.md` — session report, including how the resume bug
   managed to imitate a no-op and fool the first round of measurements.
 
-## 2026-07-11
+## v0.1.0 — 2026-07-11
 
 - **Start at login** (`590fcfe`) — a switch in the settings popover, rather than
   editing `~/.config/autostart` by hand.
