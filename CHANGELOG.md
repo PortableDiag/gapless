@@ -5,6 +5,16 @@ All notable changes to Gapless. Newest first.
 The project is pre-1.0; entries are grouped by release and carry the commit
 that made them.
 
+## v0.1.2 — 2026-07-20
+
+- **Self-contained AppImage release** (`Gapless-x86_64.AppImage`): bundles the
+  whole GTK4/libadwaita and GStreamer stacks (all plugins + gst-plugin-scanner),
+  so it runs on any distro — including KDE boxes that ship neither libadwaita
+  nor a full GStreamer plugin set. Built by `scripts/build-appimage.sh`.
+  The AppRun defaults `$APPDIR` before the GStreamer hook runs, so the tree
+  also works extracted (how Linux App Manager installs it) — without that,
+  playback would find no decoders.
+
 ## v0.1.1 — 2026-07-13
 
 ### Fixed
