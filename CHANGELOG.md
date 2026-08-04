@@ -5,6 +5,27 @@ All notable changes to Gapless. Newest first.
 The project is pre-1.0; entries are grouped by release and carry the commit
 that made them.
 
+## Unreleased
+
+### Documentation
+
+- **Two of the three verification scripts need a display, and nothing said so.**
+  `verify-resume.sh` and `verify-mpris-modes.sh` launch the real application, so
+  `DISPLAY` has to be set; from a desktop terminal it always is, which is why
+  this went unrecorded through five releases. Run over ssh or from anything that
+  doesn't inherit the session environment, they fail without mentioning a
+  display — and `verify-mpris-modes.sh` pipes its own output, so a GTK startup
+  failure ends up stuck in a buffered pipe with nothing on screen at all.
+
+  README and `docs/DEVELOPING.md` now say to prefix them with `DISPLAY=:0`, note
+  that `verify.sh` alone is genuinely headless, and record the two things that
+  look like failures and aren't: the `fusermount3` / xdg-desktop-portal warning
+  wall that `dbus-run-session` emits, and the buffered-pipe trap.
+
+  Documentation only — **no version bump and no tag.** No application code
+  changed, and publishing an identical binary would push a pointless "update
+  available" to every install.
+
 ## v0.1.5 — 2026-08-03
 
 ### Added

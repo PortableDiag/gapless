@@ -119,6 +119,11 @@ Two more checks, each written after a real bug got past the ones above:
 ./scripts/verify-mpris-modes.sh  # a mode set over D-Bus must survive a SIGKILL
 ```
 
+Those two launch the real application, so they need a display — prefix them with
+`DISPLAY=:0` if you are running over ssh or from anything that isn't a desktop
+terminal. `verify.sh` renders through the engine with the audio sink swapped out
+and needs nothing.
+
 ## Documentation
 
 | | |
