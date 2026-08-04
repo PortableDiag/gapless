@@ -62,6 +62,26 @@ stale timestamp makes `audiomixer` discard the whole rewritten timeline.
 branch's data long before that branch is audible. Derive the current track from
 the playback position.
 
+**Two of the three checks need a display.** `verify-resume.sh` and
+`verify-mpris-modes.sh` launch the real application — from a desktop terminal you
+never notice, but over ssh, from cron, or from a tool that doesn't inherit the
+session environment, `DISPLAY` is unset and they fail in a way that doesn't
+mention a display:
+
+```sh
+DISPLAY=:0 ./scripts/verify-mpris-modes.sh
+```
+
+`verify.sh` is genuinely headless — it renders through the `capture` example with
+the audio sink swapped out — and needs nothing.
+
+Two things that look like failures and aren't. `verify-mpris-modes.sh` re-execs
+itself under `dbus-run-session`, which starts its own xdg-desktop-portal: the
+`fusermount3: Permission denied` and portal warnings on stderr are normal noise,
+and the verdict is in the last few lines. And because it pipes its own output, a
+GTK startup failure gets stuck in a buffered pipe — redirect to a file rather
+than piping to `tail` while you are debugging one.
+
 ## Before you commit
 
 ```sh
