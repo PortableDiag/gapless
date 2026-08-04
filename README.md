@@ -136,3 +136,7 @@ open), no search, no queue editing, no folder.jpg cover fallback.
 Note that **Next is a hard cut, deliberately** — it tears the mixer timeline down
 and starts the new track at once. Crossfade applies to the track that follows
 naturally, not to a skip.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
