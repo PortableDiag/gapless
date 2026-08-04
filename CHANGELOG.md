@@ -5,6 +5,85 @@ All notable changes to Gapless. Newest first.
 The project is pre-1.0; entries are grouped by release and carry the commit
 that made them.
 
+## v0.1.3 — 2026-08-03
+
+**No application code changed in this release.** Everything here is the
+verification harness and the documentation, so the v0.1.2 AppImage is still
+current and there is no binary to update. The theme is that several things the
+project *claimed* to measure were not being measured, and one of them could not
+be measured by anyone but the author.
+
+### Added
+
+- **`verify.sh` now measures the three features too** — silence trim, interior
+  silence cap and crossfade — via a new `scripts/verify-features.py`. Together
+  with the negative controls below, every line the README prints as a result is
+  now produced by the run rather than quoted from a measurement taken once.
+
+  Each feature is rendered **twice**, off and on, and the check fails if the
+  *off* render does not show the defect. A trim that passes because the fixture
+  had no silence in it proves nothing.
+
+  The crossfade check measures the **shape** of the fade rather than its length,
+  because duration cannot tell equal-power from linear — both turn a 20 s render
+  into exactly 17 s. The fixtures are an octave apart, so projecting the render
+  onto each tone recovers the gain applied to each branch, and equal power means
+  `a² + b²` holds at 1 across the overlap. Measured 0.13%; a synthetic linear
+  fade of identical duration was put through the same check and sagged 49.99%, so
+  the check is known to separate them.
+
+- **`make-test-tones.sh` now builds every fixture the harness uses**, not just
+  the tone pair: `xf-440`, `xf-880`, `sil-part1`, `hole` and `sweep`. `testdata/`
+  is gitignored, so those five existed only on the machine they were first made
+  on. This was already load-bearing and already broken — `verify-resume.sh`
+  guarded itself with `[ -f testdata/xf-440.mp3 ] || ./scripts/make-test-tones.sh`,
+  and the script it called did not build `xf-440.mp3`, so on a clean checkout the
+  guard fired, achieved nothing, and the render failed on a missing file.
+  `verify.sh` now also checks for a feature fixture, so a `testdata/` predating
+  this change is completed rather than left half-built.
+
+### Removed
+
+- **The `real library (ADM)` line is gone from `docs/VERIFICATION.md`.** It was
+  measured against a personal music library that is not in the repo and cannot be
+  re-measured by anyone reading the document. A number nobody can reproduce is an
+  assertion with a decimal point on it.
+
+### Fixed
+
+- **`verify.sh` now runs the negative controls it always claimed to.** Both the
+  README and the script's own header said it ran deliberately-broken captures
+  through the analyser — *"a test that cannot fail proves nothing"* — and it did
+  not. It ran two checks. The seven broken splices were recorded in
+  `docs/VERIFICATION.md` as measurements that had been taken, but no code in the
+  repo could re-take them: `verify-gapless.py` accepted a single WAV path and had
+  no negative mode. For a project whose entire verification argument is that a
+  check must be able to fail, the check that proves the analyser can fail was the
+  one not wired up.
+
+  `verify-gapless.py --negative CAPTURE.wav` now synthesises the seven breaks — a
+  20 ms silence splice and sample drops of 25/50/75/100/150/200 — into the
+  midpoint of a good render, and requires each to be caught by at least one of
+  the three checks. It prints the full matrix of which check caught what, because
+  the **dots** are the argument: a 25-sample drop is 0.57 ms and hides inside the
+  length tolerance, so only the phase test sees it; drops of 100 and 200 remove a
+  whole number of cycles (one period is 100.2 samples) and are phase-invisible by
+  construction, so only the length test sees them. Delete either check and a real
+  defect walks through.
+
+- **README linked a session report that had been deleted.** `b345c7f` moved
+  session reports out to an external log directory and removed
+  `docs/SESSION-2026-07-12.md`, but the Documentation table kept pointing at it —
+  a dead link on the front page, whose description also still advertised "the
+  open crossfade bug" that v0.1.1 had closed. The row is gone; `CHANGELOG.md`
+  carries that history and ships with the repo.
+
+- **README no longer overstates what `verify.sh` measures.** Its result block
+  listed six lines; the script produced two. The gap was closed from both ends —
+  the script grew the negative controls and the three feature checks above, and
+  the one line that could never be reproduced (`real library (ADM)`) was removed
+  rather than left standing. Every line in the block is now output of the run.
+
 ## v0.1.2 — 2026-07-20
 
 - **Self-contained AppImage release** (`Gapless-x86_64.AppImage`): bundles the

@@ -68,6 +68,17 @@ the playback position.
 cargo build --release && ./scripts/verify.sh
 ```
 
-The gapless result must stay `PASS`, and the negative controls must stay 7/7. Both
-have caught real regressions in this codebase — including one where the whole
-queue silently stopped after the first track.
+All six results must stay green: gapless `PASS`, the FLAC control `PASS`, the
+negative controls 7/7, and the silence-trim, interior-cap and crossfade checks.
+These have caught real regressions in this codebase — including one where the
+whole queue silently stopped after the first track.
+
+Each feature check renders the feature **off** as well as on, and fails if the
+off render does not show the defect it is meant to fix. That baseline is part of
+the test, not scaffolding: a trim that passes because the fixture had no silence
+in it proves nothing.
+
+`testdata/` is gitignored, so anything a check depends on has to be built by
+`scripts/make-test-tones.sh` — otherwise it works only on the machine it was
+first made on. `verify.sh` runs that script for you when the tree is missing or
+incomplete.

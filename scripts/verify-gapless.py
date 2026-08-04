@@ -23,6 +23,17 @@ back to back. Three things must hold, each failing in a different way:
      DC, where its instantaneous phase should be a constant. Averaging over one
      period kills the image at 2f. Any splice then shows up as a step in that
      phase, whatever part of the cycle it landed on.
+
+Run with --negative to check the checker: seven deliberately broken captures are
+synthesised from a good render, and every one of them must be caught by at least
+one of the three checks. No single check catches all seven, which is the point —
+they cover for each other. A drop of 100 samples is phase-invisible by
+construction (one period is 100.2 samples at 440 Hz / 44.1 kHz) and is caught on
+length; a drop of 25 samples is 0.57 ms, inside the length tolerance, and is
+caught on phase.
+
+    verify-gapless.py CAPTURE.wav              measure one render
+    verify-gapless.py --negative CAPTURE.wav   prove the analyser can fail
 """
 import sys
 import wave
@@ -66,51 +77,61 @@ def phase_steps(x, sr):
     return jump, w
 
 
-def main():
-    if len(sys.argv) < 2:
-        sys.exit("usage: verify-gapless.py CAPTURE.wav")
-    path = sys.argv[1]
-    x, sr = load(path)
-    dur = len(x) / sr
-    amp = np.percentile(np.abs(x), 99.9)
-
-    print(f"{path}")
-    print(f"  {len(x)} frames @ {sr} Hz = {dur:.4f} s   peak≈{amp:.3f}")
-    print()
-    failures = []
-
-    # --- 1. length ----------------------------------------------------
-    drift_ms = (dur - EXPECTED_SECONDS) * 1000.0
+def check_length(x, sr):
+    drift_ms = (len(x) / sr - EXPECTED_SECONDS) * 1000.0
     ok = abs(drift_ms) < LENGTH_TOL_MS
-    print(f"  [{'PASS' if ok else 'FAIL'}] length      "
-          f"{len(x)} frames vs {int(EXPECTED_SECONDS * sr)} expected ({drift_ms:+.2f} ms)")
-    if not ok:
-        failures.append(f"render is {drift_ms:+.2f} ms off — samples are being added or dropped "
-                        f"(encoder padding not stripped, or a lossy splice)")
+    line = f"{len(x)} frames vs {int(EXPECTED_SECONDS * sr)} expected ({drift_ms:+.2f} ms)"
+    why = (f"render is {drift_ms:+.2f} ms off — samples are being added or dropped "
+           f"(encoder padding not stripped, or a lossy splice)")
+    return ok, line, why
 
-    # --- 2. interior silence ------------------------------------------
+
+def check_silence(x, sr):
+    amp = np.percentile(np.abs(x), 99.9)
     win = 64
     frames = x[: len(x) // win * win].reshape(-1, win)
     quiet = np.flatnonzero(np.abs(frames).max(axis=1) < 0.02 * amp)
     interior = quiet[(quiet > 2) & (quiet < len(frames) - 3)]
     silence_ms = len(interior) * win / sr * 1000.0
     ok = silence_ms < 1.0
-    print(f"  [{'PASS' if ok else 'FAIL'}] silence     "
-          f"{silence_ms:.2f} ms of interior digital silence")
-    if not ok:
-        failures.append(f"{silence_ms:.1f} ms of silence at {interior[0] * win / sr:.3f}s "
-                        f"— the pipeline is being torn down between tracks")
+    line = f"{silence_ms:.2f} ms of interior digital silence"
+    at = interior[0] * win / sr if len(interior) else 0.0
+    why = (f"{silence_ms:.1f} ms of silence at {at:.3f}s "
+           f"— the pipeline is being torn down between tracks")
+    return ok, line, why
 
-    # --- 3. phase continuity ------------------------------------------
+
+def check_continuity(x, sr):
     jump, w = phase_steps(x, sr)
     worst = float(jump.max())
     ok = worst < PHASE_STEP_RAD
-    print(f"  [{'PASS' if ok else 'FAIL'}] continuity  "
-          f"max phase step {worst:.4f} rad (limit {PHASE_STEP_RAD})")
-    if not ok:
-        at = (int(jump.argmax()) + w) / sr
-        failures.append(f"phase discontinuity of {worst:.3f} rad at {at:.4f}s "
-                        f"— audible as a click")
+    line = f"max phase step {worst:.4f} rad (limit {PHASE_STEP_RAD})"
+    at = (int(jump.argmax()) + w) / sr
+    why = f"phase discontinuity of {worst:.3f} rad at {at:.4f}s — audible as a click"
+    return ok, line, why
+
+
+def run_checks(x, sr):
+    """The three checks, as (name, ok, line, why). Nothing is printed."""
+    return [
+        ("length", *check_length(x, sr)),
+        ("silence", *check_silence(x, sr)),
+        ("continuity", *check_continuity(x, sr)),
+    ]
+
+
+def analyse(path):
+    x, sr = load(path)
+    amp = np.percentile(np.abs(x), 99.9)
+    print(f"{path}")
+    print(f"  {len(x)} frames @ {sr} Hz = {len(x) / sr:.4f} s   peak≈{amp:.3f}")
+    print()
+
+    failures = []
+    for name, ok, line, why in run_checks(x, sr):
+        print(f"  [{'PASS' if ok else 'FAIL'}] {name:<12}{line}")
+        if not ok:
+            failures.append(why)
 
     print()
     if failures:
@@ -119,6 +140,60 @@ def main():
             print(f"    - {f}")
         sys.exit(1)
     print("  GAPLESS: PASS — the two files rendered as one unbroken tone.")
+
+
+def broken_variants(x, sr):
+    """Deliberately damaged copies of a good capture, spliced at the midpoint.
+
+    The midpoint is where the two test-tone halves already meet, so a defect
+    injected here is exactly the defect a broken pipeline would produce.
+    """
+    mid = len(x) // 2
+    gap = np.zeros(int(round(0.020 * sr)))
+    cases = [("20 ms silence splice", np.concatenate([x[:mid], gap, x[mid:]]))]
+    for n in (25, 50, 75, 100, 150, 200):
+        cases.append((f"drop {n} samples", np.concatenate([x[:mid], x[mid + n:]])))
+    return cases
+
+
+def negative_controls(path):
+    """A check that cannot fail proves nothing. Every break must be caught."""
+    x, sr = load(path)
+    cases = broken_variants(x, sr)
+
+    print(f"synthesised from {path}")
+    print()
+    print(f"  {'broken capture':<22}{'length':<10}{'silence':<10}{'continuity':<12}verdict")
+    slipped = []
+    for name, y in cases:
+        caught = [not ok for _, ok, _, _ in run_checks(y, sr)]
+        cells = "".join(f"{'CAUGHT' if c else '·':<10}" for c in caught[:2])
+        cells += f"{'CAUGHT' if caught[2] else '·':<12}"
+        print(f"  {name:<22}{cells}{'caught' if any(caught) else 'SLIPPED THROUGH'}")
+        if not any(caught):
+            slipped.append(name)
+
+    print()
+    total = len(cases)
+    if slipped:
+        print(f"  NEGATIVE CONTROLS: FAIL — {len(slipped)}/{total} slipped through")
+        for name in slipped:
+            print(f"    - {name} was not caught by any of the three checks")
+        sys.exit(1)
+    print(f"  NEGATIVE CONTROLS: PASS — {total}/{total} broken splices caught.")
+    print("  No single check catches all of them; they cover for each other.")
+
+
+def main():
+    args = sys.argv[1:]
+    if args and args[0] == "--negative":
+        if len(args) < 2:
+            sys.exit("usage: verify-gapless.py --negative CAPTURE.wav")
+        negative_controls(args[1])
+    elif len(args) == 1:
+        analyse(args[0])
+    else:
+        sys.exit("usage: verify-gapless.py [--negative] CAPTURE.wav")
 
 
 if __name__ == "__main__":
