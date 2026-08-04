@@ -111,9 +111,35 @@ A check that cannot fail proves nothing. So the analyser is run against
 deliberately broken captures — a 20 ms silence splice, plus sample drops of
 25/50/75/100/150/200 — and **must catch all seven**.
 
-Note the drop of 100 samples: at 440 Hz / 44.1 kHz one period is 100.2 samples, so
-that splice is phase-*invisible* by construction. It is caught by the length check
-instead. The three checks cover for each other on purpose.
+`verify.sh` runs this, or drive it directly against any good capture:
+
+```sh
+python3 scripts/verify-gapless.py --negative /tmp/gapless-verify/mp3.wav
+```
+
+The breaks are spliced into the midpoint of a *good* render — which is where the
+two test-tone halves already meet, so an injected defect is exactly the defect a
+broken pipeline would produce. The run prints which check caught what, because
+that matrix is the whole argument:
+
+```
+  broken capture        length    silence   continuity  verdict
+  20 ms silence splice  CAUGHT    CAUGHT    CAUGHT      caught
+  drop 25 samples       ·         ·         CAUGHT      caught
+  drop 50 samples       CAUGHT    ·         CAUGHT      caught
+  drop 75 samples       CAUGHT    ·         CAUGHT      caught
+  drop 100 samples      CAUGHT    ·         ·           caught
+  drop 150 samples      CAUGHT    ·         CAUGHT      caught
+  drop 200 samples      CAUGHT    ·         ·           caught
+```
+
+**Read the dots, not the CAUGHTs.** No single check catches all seven. A drop of
+25 samples is 0.57 ms, comfortably inside the 1 ms length tolerance, and only the
+phase test sees it. Drops of 100 and 200 samples are phase-*invisible* by
+construction — at 440 Hz / 44.1 kHz one period is 100.2 samples, so those splices
+remove a whole number of cycles — and only the length check sees them. Delete
+either check and a real defect walks straight through. The three cover for each
+other on purpose.
 
 ## Current results
 
@@ -126,11 +152,51 @@ gapless (crossfade 0, trim off)
   FLAC control: PASS
 
 negative controls        7/7 broken splices caught
-silence trim             1002 ms gap -> 9 ms
-interior silence cap     3000 ms pause -> 1015 ms (1.0 s cap), tail intact
-crossfade 3 s            20.0 s -> 17.0 s, equal-power (sum of squares constant)
-real library (ADM)       1064 ms gap at the join -> 0 ms
+silence trim             1000 ms gap -> 10 ms
+interior silence cap     3000 ms pause -> 1010 ms (1.0 s cap), tail intact
+crossfade 3 s            20.0 s -> 17.0 s, equal-power to 0.13%
 ```
+
+Every line is produced by `./scripts/verify.sh`. An earlier version of this block
+also carried `real library (ADM) 1064 ms gap at the join -> 0 ms`; that has been
+removed rather than left in, because it was measured against a personal music
+library that is not in the repo and cannot be re-measured by anyone reading this.
+A number nobody can reproduce is an assertion with a decimal point on it, which
+is the thing this document exists to avoid.
+
+## The three features
+
+These are not "is the splice gapless", and each regresses on its own, so
+`scripts/verify-features.py` measures them separately. Every one is rendered
+**twice** — the feature off, then on — and the check fails if the *off* render
+does not show the defect it is supposed to fix. A trim that passes because the
+fixture had no silence in it proves nothing, for the same reason the analyser has
+negative controls.
+
+| Check | Fixture | What the "off" render must show |
+|---|---|---|
+| `trim` | `sil-part1.mp3` + `mp3-part2.mp3` | a ~1000 ms hole at the join |
+| `inner` | `hole.mp3` | a 3000 ms pause mid-track |
+| `crossfade` | `xf-440.mp3` + `xf-880.mp3` | no stretch where both tones sound |
+
+**The crossfade check measures the shape of the fade, not its length**, which
+matters because duration alone cannot tell an equal-power fade from a linear one:
+both shorten a 20 s render to exactly 17 s. The two fixtures are an octave apart,
+so projecting the render onto each frequency recovers the gain the engine applied
+to each branch — and equal power means `a² + b²` stays at 1 across the overlap.
+Measured: **0.13%** departure. A synthetic linear fade of identical duration was
+run through the same check and sags by **49.99%**, so the check is known to
+separate them rather than assumed to.
+
+Note that with a crossfade set, a render also fades **in** over its first seconds
+and **out** over its last — the first and last branches have nothing to cross
+with, so their envelopes run against silence. That is why the check reads the two
+tones separately instead of watching total loudness, which those ramps dominate.
+
+Fixtures come from `scripts/make-test-tones.sh`. `testdata/` is gitignored, so
+everything the checks touch has to be reproducible from that script — it wasn't
+before, and `verify-resume.sh` had been guarding itself with a call to a script
+that did not build the file it was looking for.
 
 ## Testing against real speakers
 
