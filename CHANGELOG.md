@@ -5,6 +5,31 @@ All notable changes to Gapless. Newest first.
 The project is pre-1.0; entries are grouped by release and carry the commit
 that made them.
 
+## v0.1.4 — 2026-08-03
+
+### Added
+
+- **The app can now tell you what version it is.** It could not before, in any
+  way: nothing in `src/` referenced `CARGO_PKG_VERSION`, so `strings` on a build
+  found no version anywhere, and there was no way to ask a running or installed
+  copy what it was. Version tracking lived entirely in metadata outside the
+  binary — `Cargo.toml`, the git tag, and whatever an installer recorded.
+
+  - **`gapless --version`** (also `-V`) prints `gapless <version>`. Answered
+    before GTK or the audio engine start, so it works headless, over ssh, and
+    while another copy is already running — none of which can open a dialog.
+    Handled directly rather than through `GApplication`, which would need a
+    running instance to reply.
+  - **An About dialog**, from the bottom of the settings popover. States what
+    the program is and which version this is, with links to the repository and
+    the issue tracker.
+
+  Both take the number from `env!("CARGO_PKG_VERSION")`, so it can only be wrong
+  by being wrong in `Cargo.toml`.
+
+  No license is declared in the dialog: the repo carries no LICENSE file and
+  `Cargo.toml` has no `license` field, and stating one would invent a legal fact.
+
 ## v0.1.3 — 2026-08-03
 
 **No application code changed in this release.** Everything here is the

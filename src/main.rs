@@ -14,6 +14,24 @@ use std::time::{Duration, Instant};
 
 const APP_ID: &str = "com.procomputation.Gapless";
 
+/// Taken from Cargo.toml at compile time, so the number can only be wrong by
+/// being wrong in one place. Nothing else in the binary carried its version
+/// before this: `strings` on a build found no "0.1.x" anywhere, so there was no
+/// way to ask a running or installed copy what it was.
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Shown in the About dialog. Says what the program is *for*, because "a music
+/// player" does not explain why this one exists.
+const ABOUT_TEXT: &str = "\
+A music player that plays albums without holes in them.
+
+The gap between tracks has two causes, and fixing only the famous one leaves you \
+still hearing a gap: the pipeline stops and restarts between files, and a great \
+many rips have silence recorded into them. Gapless fixes both, and can crossfade \
+instead if you would rather.
+
+The gapless claim is measured rather than asserted — see docs/VERIFICATION.md.";
+
 /// How long after a user seek to ignore pipeline position reports. A flushing
 /// seek keeps reporting the *old* position for a moment; without this the
 /// slider snaps backwards under the cursor before catching up.
@@ -65,9 +83,35 @@ struct Ui {
 }
 
 fn main() -> glib::ExitCode {
+    // Answered before GTK or the audio engine start, so it works headless, over
+    // ssh, and against a copy that is already running — none of which can open
+    // the About dialog. Handled here rather than left to GApplication, which
+    // would need a registered option and a running instance to reply.
+    if std::env::args().skip(1).any(|a| a == "--version" || a == "-V") {
+        println!("gapless {VERSION}");
+        return glib::ExitCode::SUCCESS;
+    }
+
     let app = adw::Application::builder().application_id(APP_ID).build();
     app.connect_activate(build_window);
     app.run()
+}
+
+/// The About dialog — the only place the *running* app states its version.
+/// `--version` covers the installed binary; this covers the copy in front of you.
+fn show_about(parent: &impl IsA<gtk::Widget>) {
+    // No license is declared: the repo carries no LICENSE file and Cargo.toml has
+    // no `license` field, and stating one here would invent a legal fact.
+    let about = adw::AboutDialog::builder()
+        .application_name("Gapless")
+        .application_icon(APP_ID)
+        .version(VERSION)
+        .developer_name("PortableDiag")
+        .comments(ABOUT_TEXT)
+        .website("https://github.com/PortableDiag/gapless")
+        .issue_url("https://github.com/PortableDiag/gapless/issues")
+        .build();
+    about.present(Some(parent));
 }
 
 fn build_window(app: &adw::Application) {
@@ -433,7 +477,24 @@ fn build_prefs(
     content.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
     content.append(&login_row);
 
+    let about_button = gtk::Button::builder()
+        .label("About Gapless")
+        .css_classes(["flat"])
+        .build();
+    content.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+    content.append(&about_button);
+
     let popover = gtk::Popover::builder().child(&content).build();
+    about_button.connect_clicked({
+        let popover = popover.clone();
+        move |btn| {
+            // Dismiss the popover first. Presenting a dialog from a widget that
+            // is about to be unmapped leaves it parented to nothing, and it
+            // opens detached from the window.
+            popover.popdown();
+            show_about(btn);
+        }
+    });
     let button = gtk::MenuButton::builder()
         .icon_name("emblem-system-symbolic")
         .tooltip_text("Playback settings")
