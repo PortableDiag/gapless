@@ -2,3 +2,4 @@ target/
 testdata/
 *.wav
 dist/
+__pycache__/
