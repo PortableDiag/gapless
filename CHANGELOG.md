@@ -5,6 +5,20 @@ All notable changes to Gapless. Newest first.
 The project is pre-1.0; entries are grouped by release and carry the commit
 that made them.
 
+## v0.1.5 — 2026-08-03
+
+### Added
+
+- **The project is now licensed: MIT.** It had no `LICENSE` file and no `license`
+  field, which by default means *all rights reserved* — an odd footing for a
+  public repository that publishes AppImages, and the reason v0.1.4's About
+  dialog stayed silent on the subject rather than inventing an answer.
+
+  Stated in three places, which must agree: `LICENSE` (MIT, © 2026 PortableDiag),
+  the `license = "MIT"` field in `Cargo.toml`, and the About dialog's **Legal**
+  page, via `gtk::License::MitX11` — GTK's name for the same MIT/X11 licence.
+  A copyright line was added alongside it.
+
 ## v0.1.4 — 2026-08-03
 
 ### Added

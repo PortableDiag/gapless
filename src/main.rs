@@ -100,8 +100,9 @@ fn main() -> glib::ExitCode {
 /// The About dialog — the only place the *running* app states its version.
 /// `--version` covers the installed binary; this covers the copy in front of you.
 fn show_about(parent: &impl IsA<gtk::Widget>) {
-    // No license is declared: the repo carries no LICENSE file and Cargo.toml has
-    // no `license` field, and stating one here would invent a legal fact.
+    // MitX11 is GTK's name for the MIT/X11 licence — the same one in LICENSE and
+    // in Cargo.toml's `license` field. All three have to agree; this is the copy
+    // a user actually sees.
     let about = adw::AboutDialog::builder()
         .application_name("Gapless")
         .application_icon(APP_ID)
@@ -110,6 +111,8 @@ fn show_about(parent: &impl IsA<gtk::Widget>) {
         .comments(ABOUT_TEXT)
         .website("https://github.com/PortableDiag/gapless")
         .issue_url("https://github.com/PortableDiag/gapless/issues")
+        .copyright("© 2026 PortableDiag")
+        .license_type(gtk::License::MitX11)
         .build();
     about.present(Some(parent));
 }

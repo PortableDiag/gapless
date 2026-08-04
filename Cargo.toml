@@ -1,7 +1,8 @@
 [package]
 name = "gapless"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2021"
+license = "MIT"
 
 [dependencies]
 # These four must stay on the same glib generation (0.20) or you get two
