@@ -51,6 +51,8 @@ both, and can crossfade instead if you'd rather.
   track and position you stopped at. Cued up, not auto-played.
 - **Start at login** — a switch in the settings popover, no fiddling with
   `~/.config/autostart` by hand.
+- **About dialog**, and `gapless --version` for asking an installed copy what it
+  is without opening a window.
 
 ## Install
 
