@@ -5,6 +5,74 @@ All notable changes to Gapless. Newest first.
 The project is pre-1.0; entries are grouped by release and carry the commit
 that made them.
 
+## v0.4.0 — 2026-09-13
+
+### Added
+
+- **A running player can now be replaced without a gap in the music.**
+  `scripts/handover.sh` starts a second copy alongside the one that is playing,
+  hands the track over mid-playback and retires the old one. Measured on this
+  machine: replacement up in **0.5 s** while the old one kept playing, and a
+  **34 ms** swap — an overlap, not a hole.
+
+  This was impossible before, and the reason is worth stating: `GApplication` is
+  single-instance, so launching Gapless while it is running hands the request to
+  the copy already there and **exits**. That is right for a desktop launcher and
+  it means the only way to replace the player was to kill it first and leave the
+  room silent until the new one came up. Two flags fix it:
+
+  | | |
+  |---|---|
+  | `--new-instance` | run a second copy instead of deferring to the first |
+  | `--api-port N` | listen somewhere else for this run, since the outgoing copy still owns the configured port. **Not saved** — a handover's scratch port must not become the configured one. |
+
+  The order matters and is deliberate: the replacement is pre-rolled **paused**
+  at the right position so its pipeline is already built, then it plays and the
+  old one pauses back to back. They overlap for a few tens of milliseconds
+  rather than leaving a hole — a listener notices silence, not a brief doubling.
+
+- **`POST /api/listen {port}`** moves the API to another port at run time. This
+  is what lets a handover finish cleanly: the replacement starts on a scratch
+  port and takes the configured one once the outgoing copy is gone. Without it
+  every handover would leave the API somewhere nobody thinks to look.
+
+- **`audio_sink` in `GET /api/status`** — the element `autoaudiosink` actually
+  chose.
+
+  This exists because of a real failure earlier the same day: after an in-place
+  update, the player reported `playing: true` with the position climbing and
+  **no audio stream attached to the sink at all**. Two minutes of silence, and
+  nothing the player exposed could tell that apart from working — the pipeline's
+  own state says PLAYING either way. `scripts/handover.sh` now checks for a real
+  stream rather than trusting the API's word, which is the lesson.
+
+### Fixed
+
+- **A single wrong type in `state.json` silently reset every setting.** One field
+  of the wrong type fails the whole parse, and the loader's
+  `.ok().unwrap_or_default()` swallowed the error — volume, resume point, API
+  port, all quietly back to defaults, indistinguishable from the file having been
+  deleted. It now says which file and why, and leaves the file alone so it can be
+  inspected. Found when a hand-written `"shuffle": "off"` (it is a bool;
+  `shuffle_mode` is the string) moved the control API back to its default port
+  with no message.
+
+### Verification
+
+- `scripts/handover.sh` reports `[FAIL]` rather than a bare exit if the outgoing
+  copy does not quit, if nothing answers afterwards, or if the API says playing
+  while **no stream is attached to the sink**.
+
+  The first version of it printed `[PASS]` while doing **nothing at all**:
+  `old() { curl "http://127.0.0.1:$PORT$@"; }` glues the first argument onto the
+  port, so every URL was `127.0.0.1:18441-X` and every call failed silently
+  behind `curl -sf`. The replacement happened to resume from `state.json` on its
+  own, which looked exactly like a successful handover. URLs are built
+  explicitly now, and the check requires **exactly one** instance left.
+
+`cargo test` 34/34 · `verify.sh` 6/6 · `verify-resume.sh` 4/4 ·
+`verify-mpris-modes.sh` 4/4 · `verify-api.sh` 44/44 · `verify-input.sh` 9/9
+
 ## v0.3.2 — 2026-09-13
 
 ### Fixed

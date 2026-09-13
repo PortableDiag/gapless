@@ -77,10 +77,26 @@ impl Settings {
         let Some(path) = config_path() else {
             return Self::default();
         };
-        std::fs::read_to_string(path)
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default()
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            return Self::default();
+        };
+        match serde_json::from_str(&text) {
+            Ok(settings) => settings,
+            Err(e) => {
+                // SAY SO. One field of the wrong type fails the whole parse, and
+                // falling back to defaults silently resets *everything* — volume,
+                // the resume point, the API port. That is indistinguishable from
+                // the file having been deleted, and it cost a confusing debugging
+                // session here when a hand-written `"shuffle": "off"` (it is a
+                // bool) quietly moved the control API back to its default port.
+                eprintln!(
+                    "gapless: {} is not valid ({e}); starting from defaults and \
+                     leaving the file alone so it can be inspected",
+                    path.display()
+                );
+                Self::default()
+            }
+        }
     }
 
     pub fn save(&self) {
@@ -172,6 +188,25 @@ mod tests {
         s.set_shuffle_mode("off");
         assert!(!s.shuffle);
         assert_eq!(s.shuffle_mode_str(), "off");
+    }
+
+    /// A field of the wrong type must not be mistaken for a valid config. The
+    /// caller gets defaults, but the *user* gets told — see `load`.
+    #[test]
+    fn a_wrong_type_fails_the_parse_rather_than_being_ignored() {
+        // `shuffle` is a bool; a string is a type error, not a coercion.
+        let bad = r#"{ "volume": 0.5, "shuffle": "off" }"#;
+        assert!(
+            serde_json::from_str::<Settings>(bad).is_err(),
+            "a wrong type must be an error, so `load` can report it instead of \
+             silently resetting every other setting too"
+        );
+
+        // And the same file with the right type keeps everything.
+        let good = r#"{ "volume": 0.5, "shuffle": false, "api_port": 18441 }"#;
+        let s: Settings = serde_json::from_str(good).unwrap();
+        assert_eq!(s.volume, 0.5);
+        assert_eq!(s.api_port, 18441);
     }
 
     #[test]

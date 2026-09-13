@@ -278,6 +278,15 @@ pub struct Player {
     pipeline: gst::Pipeline,
     mixer: gst::Element,
     volume: gst::Element,
+    /// Kept so we can report what audio is actually going *to*.
+    ///
+    /// `autoaudiosink` is a bin that picks a real sink at run time, and when that
+    /// choice goes wrong the pipeline still reaches PLAYING and the position
+    /// still advances — it renders to nothing. That happened on this machine
+    /// right after an in-place update: the app reported playing, the position
+    /// climbed, and no stream was attached to the audio device at all. Nothing
+    /// the player exposed could tell the difference between that and working.
+    sink: gst::Element,
     queue: Arc<Mutex<Queue>>,
     sched: Arc<Mutex<Sched>>,
     trims: Arc<Mutex<HashMap<PathBuf, Trim>>>,
@@ -322,6 +331,7 @@ impl Player {
             None => gst::ElementFactory::make("autoaudiosink").build()?,
         };
 
+        let sink_handle = sink.clone();
         pipeline.add_many([&mixer, &convert, &volume, &sink])?;
 
         // ReplayGain, when the plugins are present. After the mixer, so it sees
@@ -357,6 +367,7 @@ impl Player {
             pipeline,
             mixer,
             volume,
+            sink: sink_handle,
             queue,
             sched: Arc::new(Mutex::new(Sched::default())),
             trims: Arc::new(Mutex::new(HashMap::new())),
@@ -706,6 +717,33 @@ impl Player {
 
     pub fn volume(&self) -> f64 {
         self.volume.property::<f64>("volume")
+    }
+
+    /// What audio is really going to — the element `autoaudiosink` actually
+    /// chose, not the bin's own name.
+    ///
+    /// Answering "is it playing?" from the pipeline state is not enough. A sink
+    /// that failed to open the device leaves the pipeline PLAYING and the
+    /// position advancing while nothing reaches the speakers, which is
+    /// indistinguishable from working unless something names the sink. Reported
+    /// by the control API so a caller — or a person — can see it.
+    pub fn audio_sink(&self) -> String {
+        // `autoaudiosink` is a bin; the element that matters is the child it
+        // picked. An explicitly supplied sink is not a bin and answers for itself.
+        let chosen = self
+            .sink
+            .downcast_ref::<gst::Bin>()
+            .and_then(|bin| bin.iterate_sinks().into_iter().flatten().next())
+            .map(|e| e.factory().map(|f| f.name().to_string()).unwrap_or_default());
+
+        match chosen {
+            Some(name) if !name.is_empty() => name,
+            _ => self
+                .sink
+                .factory()
+                .map(|f| f.name().to_string())
+                .unwrap_or_else(|| "unknown".into()),
+        }
     }
 
     /// Position within the current track.

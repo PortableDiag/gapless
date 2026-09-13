@@ -158,6 +158,16 @@ only and every route needs the key. The whole reference is
 **[docs/API.md](docs/API.md)**, and the running build serves its own copy at
 `GET /api/docs` — so pointing an agent at the port is enough.
 
+## Replacing it while it is playing
+
+```sh
+./scripts/handover.sh
+```
+
+Starts a second copy alongside, hands the track over mid-playback and retires the
+old one — **34 ms** of overlap instead of a silent gap. Uses `--new-instance` and
+`--api-port`; see [docs/API.md](docs/API.md).
+
 ## Documentation
 
 | | |

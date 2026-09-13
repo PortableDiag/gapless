@@ -92,6 +92,10 @@ struct Ui {
     api: RefCell<Option<api::Server>>,
     api_tx: async_channel::Sender<ApiRequest>,
     api_key: RefCell<String>,
+    /// The popover's "listening on …" line. Held so a rebind driven over the API
+    /// repaints it too — otherwise the settings page keeps advertising a port
+    /// nothing is bound to any more.
+    api_note: RefCell<Option<gtk::Label>>,
     seek: gtk::Scale,
     time_label: gtk::Label,
     list: gtk::ListBox,
@@ -149,9 +153,33 @@ fn main() -> glib::ExitCode {
         }
     }
 
-    let app = adw::Application::builder().application_id(APP_ID).build();
+    // A SECOND COPY, deliberately. Normally `GApplication` is single-instance:
+    // launching Gapless while it is running hands the request to the copy that
+    // is already there and exits, which is right for a desktop launcher and
+    // wrong for a handover.
+    //
+    // Replacing a running player any other way means killing it first and
+    // leaving the room silent for as long as the new one takes to come up. With
+    // `--new-instance` the replacement starts, loads the queue and cues the
+    // track *while the old one is still playing*; the swap is then a pause and
+    // a play, not an outage. See `scripts/handover.sh`.
+    //
+    // The second copy does not get the MPRIS name — the first still owns it —
+    // and says so rather than failing; and it needs its own `--api-port`,
+    // because the first is already bound to the configured one.
+    let second = std::env::args().skip(1).any(|a| a == "--new-instance");
+
+    let app = adw::Application::builder()
+        .application_id(APP_ID)
+        .flags(if second {
+            gtk::gio::ApplicationFlags::NON_UNIQUE
+        } else {
+            gtk::gio::ApplicationFlags::empty()
+        })
+        .build();
     app.connect_activate(build_window);
-    app.run()
+    // GTK would otherwise try to parse our own flags as GApplication options.
+    app.run_with_args::<&str>(&[])
 }
 
 /// The About dialog — the only place the *running* app states its version.
@@ -311,6 +339,7 @@ fn build_window(app: &adw::Application) {
         api: RefCell::new(None),
         api_tx,
         api_key: RefCell::new(String::new()),
+        api_note: RefCell::new(None),
         seek,
         time_label,
         list,
@@ -430,10 +459,16 @@ fn build_window(app: &adw::Application) {
     if let Some(key) = api::load_or_create_key() {
         *ui.api_key.borrow_mut() = key;
     }
-    if saved.api_enabled {
-        match api::start(saved.api_port, ui.api_key.borrow().clone(), ui.api_tx.clone()) {
+    // `--api-port N` overrides `state.json` for this run and is NOT saved: a
+    // handover instance must not rewrite the configured port on its way past.
+    // It also implies the API is wanted, so a replacement is reachable even if
+    // the setting is off.
+    let port_override = cli_api_port();
+    let api_port = port_override.unwrap_or(saved.api_port);
+    if saved.api_enabled || port_override.is_some() {
+        match api::start(api_port, ui.api_key.borrow().clone(), ui.api_tx.clone()) {
             Ok(server) => *ui.api.borrow_mut() = Some(server),
-            Err(e) => eprintln!("control API could not listen on 127.0.0.1:{}: {e}", saved.api_port),
+            Err(e) => eprintln!("control API could not listen on 127.0.0.1:{api_port}: {e}"),
         }
     }
     serve_api(&ui, &player, api_rx);
@@ -763,6 +798,8 @@ fn build_api_prefs(ui: &Rc<Ui>, saved: &Settings) -> gtk::Box {
     key_row.append(&copy);
     key_row.append(&regen);
 
+    *ui.api_note.borrow_mut() = Some(note.clone());
+
     let section = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .spacing(6)
@@ -785,19 +822,30 @@ fn api_hint(on: bool, port: u16) -> String {
 /// servers cannot hold the same port, and starting before stopping would fail
 /// with "address in use" every time the port was changed.
 fn restart_api(ui: &Rc<Ui>, port: u16, note: &gtk::Label) {
+    if let Err(e) = rebind_api(ui, port) {
+        // Say so. A control API that silently failed to start is a long
+        // afternoon for whoever is trying to call it.
+        note.set_label(&format!("Could not listen on port {port}: {e}"));
+    }
+}
+
+/// Move the listener to `port`. The old one is dropped first — two servers
+/// cannot hold the same port, and starting before stopping fails with "address
+/// in use" every time the port is changed.
+///
+/// This is what makes a handover finish cleanly: the replacement starts on a
+/// temporary port while the outgoing copy still owns the configured one, and
+/// rebinds to it once that copy is gone. Otherwise every handover would leave
+/// the API somewhere nobody thinks to look.
+fn rebind_api(ui: &Rc<Ui>, port: u16) -> std::io::Result<()> {
     *ui.api.borrow_mut() = None;
     let key = ui.api_key.borrow().clone();
-    match api::start(port, key, ui.api_tx.clone()) {
-        Ok(server) => {
-            note.set_label(&api_hint(true, port));
-            *ui.api.borrow_mut() = Some(server);
-        }
-        Err(e) => {
-            // Say so. A control API that silently failed to start is a long
-            // afternoon for whoever is trying to call it.
-            note.set_label(&format!("Could not listen on port {port}: {e}"));
-        }
+    let server = api::start(port, key, ui.api_tx.clone())?;
+    *ui.api.borrow_mut() = Some(server);
+    if let Some(note) = ui.api_note.borrow().as_ref() {
+        note.set_label(&api_hint(true, port));
     }
+    Ok(())
 }
 
 /// These two are written straight through rather than via `current_settings`,
@@ -808,6 +856,22 @@ fn save_api_settings(ui: &Rc<Ui>, enabled: bool, port: u16) {
     s.api_enabled = enabled;
     s.api_port = port;
     s.save();
+}
+
+/// `--api-port N`, or `--api-port=N`. Returns `None` when absent or unparseable
+/// rather than failing the launch: a bad port on the command line should not stop
+/// the music player from being a music player.
+fn cli_api_port() -> Option<u16> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    for (i, a) in args.iter().enumerate() {
+        if let Some(v) = a.strip_prefix("--api-port=") {
+            return v.parse().ok();
+        }
+        if a == "--api-port" {
+            return args.get(i + 1)?.parse().ok();
+        }
+    }
+    None
 }
 
 fn login_hint(on: bool) -> &'static str {
@@ -1671,6 +1735,7 @@ fn dispatch(ui: &Rc<Ui>, player: &Arc<Player>, req: &ApiRequest) -> ApiResponse 
                 "POST /api/open":      "{path} — a folder or a playlist file",
                 "GET  /api/settings":  "playback settings",
                 "POST /api/settings":  "{trim_silence?, crossfade_secs?, inner_silence_secs?}",
+                "POST /api/listen":    "{port} — move the API to another port, for a handover",
                 "GET  /api/autostart": "whether Gapless starts at login",
                 "POST /api/autostart": "{enabled}",
                 "POST /api/quit":      "close the player",
@@ -1936,6 +2001,23 @@ fn dispatch(ui: &Rc<Ui>, player: &Arc<Player>, req: &ApiRequest) -> ApiResponse 
             }))
         }
 
+        // Used by `scripts/handover.sh` after the outgoing player has exited.
+        ("/api/listen", _, true) => {
+            let Some(port) = req.u64("port") else {
+                return ApiResponse::error(400, "send port");
+            };
+            if !(1024..=65535).contains(&port) {
+                return ApiResponse::error(400, "port must be 1024-65535");
+            }
+            let port = port as u16;
+            // Deliberately not written to state.json: a handover's temporary
+            // port must not become the configured one.
+            match rebind_api(ui, port) {
+                Ok(()) => ApiResponse::ok(json!({ "ok": true, "port": port })),
+                Err(e) => ApiResponse::error(409, &format!("could not listen on {port}: {e}")),
+            }
+        }
+
         ("/api/autostart", true, _) => {
             ApiResponse::ok(json!({ "ok": true, "enabled": autostart::is_enabled() }))
         }
@@ -1992,6 +2074,7 @@ fn known_route(path: &str) -> bool {
             | "/api/rating"
             | "/api/open"
             | "/api/settings"
+            | "/api/listen"
             | "/api/autostart"
             | "/api/quit"
     )
@@ -2062,6 +2145,11 @@ fn status_json(ui: &Rc<Ui>, player: &Arc<Player>) -> Value {
         "trim_silence": player.trim_silence(),
         "crossfade_secs": player.crossfade() as f64 / 1e9,
         "inner_silence_secs": player.inner_limit() as f64 / 1e9,
+        // What audio is really going to. `playing: true` with the position
+        // advancing is NOT proof anything is audible — a sink that failed to
+        // open the device looks exactly the same from the pipeline's side. This
+        // is the field that tells them apart.
+        "audio_sink": player.audio_sink(),
         "queue_length": ui.tracks.borrow().len(),
         "source": Settings::load().last_source,
         "track": track.map(|t| track_json(current.unwrap_or(0), &t)),

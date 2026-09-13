@@ -102,6 +102,7 @@ the key needs nothing else to get started.
 | `POST /api/open` | `{path}` — a folder or a playlist |
 | `GET /api/settings` | playback settings |
 | `POST /api/settings` | `{trim_silence?, crossfade_secs?, inner_silence_secs?}` |
+| `POST /api/listen` | `{port}` — move the API to another port, for a handover |
 | `GET /api/autostart` | whether Gapless starts at login |
 | `POST /api/autostart` | `{enabled}` |
 | `POST /api/quit` | close the player |
@@ -127,6 +128,7 @@ curl -s -H "Authorization: Bearer $KEY" "$BASE/api/status"
   "trim_silence": true,
   "crossfade_secs": 5.0,
   "inner_silence_secs": 0.0,
+  "audio_sink": "pulsesink",
   "queue_length": 45,
   "source": "/home/me/Music/album",
   "track": {
@@ -145,6 +147,12 @@ curl -s -H "Authorization: Bearer $KEY" "$BASE/api/status"
   }
 }
 ```
+
+`audio_sink` is **what audio is really going to** — the element `autoaudiosink`
+actually chose. Check it. `playing: true` with `position_secs` climbing is *not*
+proof anything is audible: a sink that failed to open the device leaves the
+pipeline playing and the position advancing while nothing reaches the speakers,
+and there is no other way to tell that apart from working.
 
 `track` is **the track the now-playing panel is showing** — which is not always
 the one making noise. On a fresh launch it is the track cued from the last
@@ -265,6 +273,45 @@ curl -s -X POST -H "Authorization: Bearer $KEY" \
 
 Out of range is a 400 and changes nothing. Send at least one field or you get a
 400 saying so, rather than a successful call that did nothing.
+
+---
+
+## Replacing a running player without a gap
+
+Stopping the player and starting it again leaves the room silent for as long as
+the new copy takes to come up — and for as long as an installer takes, if you are
+updating at the same time. **`scripts/handover.sh` does it with no hole in the
+music**, measured at a **34 ms** overlap on this machine.
+
+```sh
+./scripts/handover.sh                        # e.g. after an update
+./scripts/handover.sh /path/to/other/gapless
+```
+
+It works because of two flags:
+
+| | |
+|---|---|
+| `--new-instance` | run a second copy instead of handing the request to the one already running. `GApplication` is single-instance by default, which is right for a desktop launcher and makes a handover impossible. |
+| `--api-port N` | listen somewhere else for this run. The outgoing copy still owns the configured port. **Not saved** — a handover's scratch port must not become the configured one. |
+
+The sequence, and the reasoning:
+
+1. Start the replacement on a scratch port. It loads the library and cues the
+   track **while the old copy is still playing**; this is the slow part and it
+   costs nothing.
+2. Match volume and modes, and pre-roll it **paused** at the right position, so
+   the audio pipeline is built before the swap.
+3. Read the outgoing position at the last possible moment, then play the
+   replacement and pause the old one back to back. They **overlap** for a few
+   tens of milliseconds rather than leaving a hole — that is the right way
+   round: a listener notices silence, not a brief doubling.
+4. Quit the old copy; the replacement takes the configured port with
+   `POST /api/listen`.
+5. **Check a real audio stream exists**, not just that the API says `playing`.
+
+The second copy does not get the MPRIS name — the first still owns it — and says
+so on stderr rather than failing.
 
 ---
 
