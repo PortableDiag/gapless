@@ -1,10 +1,12 @@
 use adw::prelude::*;
+use gapless::api::{self, ApiRequest, ApiResponse};
 use gapless::autostart;
 use gapless::library::{self, Track};
 use gapless::playlist;
 use gapless::player::{Player, PlayerEvent, QueuedTrack, Repeat, Shuffle};
 use gapless::ratings::{self, Ratings};
 use gapless::settings::Settings;
+use serde_json::{json, Value};
 use gapless::mpris;
 use gtk::glib;
 use std::cell::{Cell, RefCell};
@@ -76,6 +78,20 @@ struct Ui {
     repeat_button: gtk::Button,
     shuffle_button: gtk::Button,
     volume_icon: gtk::Image,
+    /// Held so the API can move the slider rather than setting the player
+    /// behind the UI's back: the slider's own handler is what tells the player,
+    /// repaints the icon and schedules the save, so driving the widget keeps an
+    /// API call and a drag on exactly the same path.
+    volume_scale: gtk::Scale,
+    /// Same reasoning, for the three playback settings. `Option` because these
+    /// are built by `build_prefs`, which needs the `Ui` that holds them.
+    trim_switch: RefCell<Option<gtk::Switch>>,
+    xfade_scale: RefCell<Option<gtk::Scale>>,
+    inner_scale: RefCell<Option<gtk::Scale>>,
+    /// The running control API, if it is switched on. Dropping it stops it.
+    api: RefCell<Option<api::Server>>,
+    api_tx: async_channel::Sender<ApiRequest>,
+    api_key: RefCell<String>,
     seek: gtk::Scale,
     time_label: gtk::Label,
     list: gtk::ListBox,
@@ -119,6 +135,22 @@ fn main() -> glib::ExitCode {
     if std::env::args().skip(1).any(|a| a == "--version" || a == "-V") {
         println!("gapless {VERSION}");
         return glib::ExitCode::SUCCESS;
+    }
+
+    // Answered here for the same reason as `--version`: a script that wants to
+    // drive the API needs the key, and asking a running GTK application for it
+    // over the API you have no key for is not a workable plan.
+    if std::env::args().skip(1).any(|a| a == "--api-key") {
+        match api::load_or_create_key() {
+            Some(key) => {
+                println!("{key}");
+                return glib::ExitCode::SUCCESS;
+            }
+            None => {
+                eprintln!("could not read or create the API key file");
+                return glib::ExitCode::FAILURE;
+            }
+        }
     }
 
     let app = adw::Application::builder().application_id(APP_ID).build();
@@ -258,6 +290,10 @@ fn build_window(app: &adw::Application) {
         })
         .collect();
 
+    // Requests arrive on the listener's threads and are executed here, on the
+    // GTK main thread, in the same place a button click would be.
+    let (api_tx, api_rx) = async_channel::unbounded::<ApiRequest>();
+
     let ui = Rc::new(Ui {
         cover,
         now_playing,
@@ -267,6 +303,13 @@ fn build_window(app: &adw::Application) {
         repeat_button,
         shuffle_button,
         volume_icon,
+        volume_scale: volume.clone(),
+        trim_switch: RefCell::new(None),
+        xfade_scale: RefCell::new(None),
+        inner_scale: RefCell::new(None),
+        api: RefCell::new(None),
+        api_tx,
+        api_key: RefCell::new(String::new()),
         seek,
         time_label,
         list,
@@ -337,13 +380,12 @@ fn build_window(app: &adw::Application) {
 
     let open_button = gtk::Button::builder().label("Open Folder…").build();
     let playlist_button = gtk::Button::builder().label("Open Playlist…").build();
-    let (prefs_button, xfade_scale, xfade_label, trim_switch) = build_prefs(&ui, &player, &saved);
+    let prefs_button = build_prefs(&ui, &player, &saved);
 
     let header = adw::HeaderBar::new();
     header.pack_start(&open_button);
     header.pack_start(&playlist_button);
     header.pack_end(&prefs_button);
-    let _ = (&xfade_scale, &xfade_label, &trim_switch);
     header.set_title_widget(Some(&adw::WindowTitle::new("Gapless", "")));
 
     let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
@@ -383,6 +425,19 @@ fn build_window(app: &adw::Application) {
         restore_last_track(&ui, &saved);
     }
 
+    // The key exists whether or not the API is switched on, so the settings
+    // popover can show it before you turn it on, and `--api-key` can print it.
+    if let Some(key) = api::load_or_create_key() {
+        *ui.api_key.borrow_mut() = key;
+    }
+    if saved.api_enabled {
+        match api::start(saved.api_port, ui.api_key.borrow().clone(), ui.api_tx.clone()) {
+            Ok(server) => *ui.api.borrow_mut() = Some(server),
+            Err(e) => eprintln!("control API could not listen on 127.0.0.1:{}: {e}", saved.api_port),
+        }
+    }
+    serve_api(&ui, &player, api_rx);
+
     install_rating_actions(app, &window, &ui, &player);
     wire_up(&window, &ui, &player, &open_button, &playlist_button, &prev_button, &next_button, &volume);
     listen_for_events(&ui, &player);
@@ -395,11 +450,7 @@ fn build_window(app: &adw::Application) {
 /// Crossfade and silence-trim live together because they are the two answers to
 /// the same complaint. Trimming removes silence that is *in the file*; crossfade
 /// overlaps the tracks instead. Crossfade at 0 is exact gapless.
-fn build_prefs(
-    ui: &Rc<Ui>,
-    player: &Arc<Player>,
-    saved: &Settings,
-) -> (gtk::MenuButton, gtk::Scale, gtk::Label, gtk::Switch) {
+fn build_prefs(ui: &Rc<Ui>, player: &Arc<Player>, saved: &Settings) -> gtk::MenuButton {
     let trim_switch = gtk::Switch::builder()
         .active(saved.trim_silence)
         .valign(gtk::Align::Center)
@@ -550,6 +601,9 @@ fn build_prefs(
     content.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
     content.append(&login_row);
 
+    content.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+    content.append(&build_api_prefs(ui, saved));
+
     let about_button = gtk::Button::builder()
         .label("About Gapless")
         .css_classes(["flat"])
@@ -574,7 +628,186 @@ fn build_prefs(
         .popover(&popover)
         .build();
 
-    (button, xfade_scale, xfade_label, trim_switch)
+    *ui.trim_switch.borrow_mut() = Some(trim_switch);
+    *ui.xfade_scale.borrow_mut() = Some(xfade_scale);
+    *ui.inner_scale.borrow_mut() = Some(inner_scale);
+
+    button
+}
+
+/// The control-API section of the settings popover: the switch, the port, and
+/// the key — which has to be *visible and copyable*, because a key the user
+/// cannot read is a key they cannot give to the thing that needs it.
+fn build_api_prefs(ui: &Rc<Ui>, saved: &Settings) -> gtk::Box {
+    let heading = gtk::Label::builder()
+        .label("Remote control API")
+        .xalign(0.0)
+        .css_classes(["heading"])
+        .build();
+
+    let note = gtk::Label::builder()
+        .label(&api_hint(saved.api_enabled, saved.api_port))
+        .xalign(0.0)
+        .wrap(true)
+        .css_classes(["dim-label", "caption"])
+        .build();
+
+    let switch = gtk::Switch::builder()
+        .active(saved.api_enabled)
+        .valign(gtk::Align::Center)
+        .build();
+
+    let port = gtk::SpinButton::with_range(1024.0, 65535.0, 1.0);
+    port.set_value(saved.api_port as f64);
+    port.set_valign(gtk::Align::Center);
+    port.set_tooltip_text(Some("Port on 127.0.0.1"));
+
+    // The key is shown in a read-only entry rather than a label so it can be
+    // selected and copied with the keyboard as well as the button.
+    let key_entry = gtk::Entry::builder()
+        .editable(false)
+        .hexpand(true)
+        .css_classes(["monospace"])
+        .build();
+    key_entry.set_text(&ui.api_key.borrow());
+    let copy = gtk::Button::builder()
+        .icon_name("edit-copy-symbolic")
+        .tooltip_text("Copy the key")
+        .css_classes(["flat"])
+        .valign(gtk::Align::Center)
+        .build();
+    let regen = gtk::Button::builder()
+        .icon_name("view-refresh-symbolic")
+        .tooltip_text("Issue a new key — anything using the old one stops working")
+        .css_classes(["flat"])
+        .valign(gtk::Align::Center)
+        .build();
+
+    copy.connect_clicked({
+        let key_entry = key_entry.clone();
+        move |btn| {
+            if let Some(display) = gtk::gdk::Display::default() {
+                display.clipboard().set_text(&key_entry.text());
+            }
+            btn.set_tooltip_text(Some("Copied"));
+        }
+    });
+
+    regen.connect_clicked({
+        let ui = ui.clone();
+        let key_entry = key_entry.clone();
+        let note = note.clone();
+        move |_| {
+            let Some(key) = api::regenerate_key() else {
+                note.set_label("Could not write the key file");
+                return;
+            };
+            *ui.api_key.borrow_mut() = key.clone();
+            key_entry.set_text(&key);
+            // The running server captured the old key, so it has to come back up
+            // on the new one or the key on screen would be a lie.
+            if ui.api.borrow().is_some() {
+                let port = ui.api.borrow().as_ref().map(|s| s.port()).unwrap_or(api::DEFAULT_PORT);
+                restart_api(&ui, port, &note);
+            }
+        }
+    });
+
+    switch.connect_state_set({
+        let ui = ui.clone();
+        let note = note.clone();
+        let port = port.clone();
+        move |_, on| {
+            if on {
+                restart_api(&ui, port.value() as u16, &note);
+            } else {
+                // Dropping the Server is what stops the listener.
+                *ui.api.borrow_mut() = None;
+                note.set_label(&api_hint(false, port.value() as u16));
+            }
+            save_api_settings(&ui, on, port.value() as u16);
+            glib::Propagation::Proceed
+        }
+    });
+
+    port.connect_value_changed({
+        let ui = ui.clone();
+        let note = note.clone();
+        let switch = switch.clone();
+        move |port| {
+            let p = port.value() as u16;
+            if switch.is_active() {
+                restart_api(&ui, p, &note);
+            } else {
+                note.set_label(&api_hint(false, p));
+            }
+            save_api_settings(&ui, switch.is_active(), p);
+        }
+    });
+
+    let switch_row = gtk::Box::builder().spacing(12).build();
+    let switch_text = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    let s1 = gtk::Label::builder()
+        .label("Let other programs control Gapless")
+        .xalign(0.0)
+        .build();
+    switch_text.append(&s1);
+    switch_text.append(&note);
+    switch_text.set_hexpand(true);
+    switch_row.append(&switch_text);
+    switch_row.append(&port);
+    switch_row.append(&switch);
+
+    let key_row = gtk::Box::builder().spacing(6).build();
+    key_row.append(&key_entry);
+    key_row.append(&copy);
+    key_row.append(&regen);
+
+    let section = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(6)
+        .build();
+    section.append(&heading);
+    section.append(&switch_row);
+    section.append(&key_row);
+    section
+}
+
+fn api_hint(on: bool, port: u16) -> String {
+    if on {
+        format!("Listening on http://127.0.0.1:{port}/api — send the key below as a Bearer token")
+    } else {
+        "Off — nothing is listening".to_string()
+    }
+}
+
+/// Start, or restart on a new port or key. Stops the old listener first: two
+/// servers cannot hold the same port, and starting before stopping would fail
+/// with "address in use" every time the port was changed.
+fn restart_api(ui: &Rc<Ui>, port: u16, note: &gtk::Label) {
+    *ui.api.borrow_mut() = None;
+    let key = ui.api_key.borrow().clone();
+    match api::start(port, key, ui.api_tx.clone()) {
+        Ok(server) => {
+            note.set_label(&api_hint(true, port));
+            *ui.api.borrow_mut() = Some(server);
+        }
+        Err(e) => {
+            // Say so. A control API that silently failed to start is a long
+            // afternoon for whoever is trying to call it.
+            note.set_label(&format!("Could not listen on port {port}: {e}"));
+        }
+    }
+}
+
+/// These two are written straight through rather than via `current_settings`,
+/// which reconstructs the whole session state from the player.
+fn save_api_settings(ui: &Rc<Ui>, enabled: bool, port: u16) {
+    let _ = ui;
+    let mut s = Settings::load();
+    s.api_enabled = enabled;
+    s.api_port = port;
+    s.save();
 }
 
 fn login_hint(on: bool) -> &'static str {
@@ -940,7 +1173,13 @@ fn load_source(ui: &Rc<Ui>, player: &Arc<Player>, path: PathBuf) {
         }
     }
 
-    while let Some(row) = ui.list.first_child() {
+    // `row_at_index(0)`, not `first_child()`. A GtkListBox's children are not all
+    // rows: the rating popover is parented to it, so `first_child()` eventually
+    // returns the popover, `remove` refuses it as a non-child, and the loop spins
+    // forever — 5.8 million "Tried to remove non-child" warnings a second, with
+    // the request that triggered it hung and the window frozen. `row_at_index`
+    // only ever returns real rows.
+    while let Some(row) = ui.list.row_at_index(0) {
         ui.list.remove(&row);
     }
     ui.row_stars.borrow_mut().clear();
@@ -1350,4 +1589,452 @@ fn set_play_icon(ui: &Rc<Ui>, playing: bool) {
 fn clock(nanos: u64) -> String {
     let secs = nanos / 1_000_000_000;
     format!("{}:{:02}", secs / 60, secs % 60)
+}
+
+// ---- the control API's command handler ---------------------------------
+//
+// Everything below runs on the GTK main thread. `src/api.rs` does the sockets,
+// the parsing and the key check; this decides what each route *means*, and it
+// deliberately goes through the same widgets and the same `Player` calls that a
+// click goes through, so an API call and a click cannot drift apart.
+
+/// Reads every request off the channel and answers it. One task, in order —
+/// two callers cannot interleave halfway through a queue change.
+fn serve_api(ui: &Rc<Ui>, player: &Arc<Player>, rx: async_channel::Receiver<ApiRequest>) {
+    let ui = ui.clone();
+    let player = player.clone();
+    glib::spawn_future_local(async move {
+        while let Ok(request) = rx.recv().await {
+            let response = dispatch(&ui, &player, &request);
+            // The connection thread is blocked waiting on this. A send error
+            // only means it gave up first (timeout, client hung up).
+            let _ = request.reply.send(response).await;
+        }
+    });
+}
+
+fn dispatch(ui: &Rc<Ui>, player: &Arc<Player>, req: &ApiRequest) -> ApiResponse {
+    let get = req.method == "GET";
+    let post = req.method == "POST";
+
+    match (req.path.as_str(), get, post) {
+        ("/api", true, _) | ("/", true, _) => ApiResponse::ok(json!({
+            "ok": true,
+            "name": "gapless",
+            "version": VERSION,
+            "endpoints": {
+                "GET  /api/docs":      "the full reference, as Markdown — ?section= narrows it",
+                "GET  /api/status":    "everything about the current state",
+                "GET  /api/queue":     "the loaded tracks, in playing order",
+                "POST /api/play":      "{index?, position_secs?} — omit both to resume",
+                "POST /api/pause":     "",
+                "POST /api/playpause": "",
+                "POST /api/stop":      "",
+                "POST /api/next":      "",
+                "POST /api/previous":  "",
+                "POST /api/seek":      "{position_secs} or {offset_secs}",
+                "POST /api/volume":    "{volume: 0.0-1.0}",
+                "POST /api/repeat":    "{mode: off|all|one}",
+                "POST /api/shuffle":   "{mode: off|on|favorites}",
+                "POST /api/rating":    "{index|path, stars: 0-5}",
+                "POST /api/open":      "{path} — a folder or a playlist file",
+                "GET  /api/settings":  "playback settings",
+                "POST /api/settings":  "{trim_silence?, crossfade_secs?, inner_silence_secs?}",
+                "GET  /api/autostart": "whether Gapless starts at login",
+                "POST /api/autostart": "{enabled}",
+                "POST /api/quit":      "close the player",
+            }
+        })),
+
+        // Served as Markdown, not JSON: the point of it is that somebody reads
+        // it, and a 20 KB document escaped into a JSON string is readable by
+        // neither a person nor an agent without a second tool.
+        ("/api/docs", true, _) => match req.string("section") {
+            None => ApiResponse::text("text/markdown; charset=utf-8", api::REFERENCE.to_string()),
+            Some(name) => match api::reference_section(&name) {
+                Some(section) => ApiResponse::text("text/markdown; charset=utf-8", section),
+                // Say which sections exist rather than serving an empty
+                // document, which looks like the endpoint is broken.
+                None => ApiResponse::error(
+                    404,
+                    &format!(
+                        "no section matching {name:?} — this document has: {}",
+                        api::reference_sections().join(", ")
+                    ),
+                ),
+            },
+        },
+
+        ("/api/status", true, _) => ApiResponse::ok(status_json(ui, player)),
+
+        ("/api/queue", true, _) => {
+            let tracks = ui.tracks.borrow();
+            let list: Vec<Value> = tracks
+                .iter()
+                .enumerate()
+                .map(|(i, t)| track_json(i, t))
+                .collect();
+            ApiResponse::ok(json!({ "ok": true, "count": list.len(), "tracks": list }))
+        }
+
+        ("/api/play", _, true) => {
+            let index = req.u64("index").map(|i| i as usize);
+            let position = req.f64("position_secs").map(|p| (p.max(0.0) * 1e9) as u64);
+
+            let result = match (index, position) {
+                (Some(i), pos) => {
+                    if i >= ui.tracks.borrow().len() {
+                        return ApiResponse::error(404, "no track at that index");
+                    }
+                    ui.resume.set(None);
+                    player.play_index_at(i, pos.unwrap_or(0))
+                }
+                // No index: resume what is cued, else carry on, else start at 0.
+                (None, pos) => {
+                    if let Some(pos) = pos {
+                        match player.current() {
+                            Some(_) => {
+                                player.seek(pos);
+                                Ok(())
+                            }
+                            None => ApiResponse::error(409, "nothing is loaded to seek in").into_err(),
+                        }
+                    } else if player.is_loaded() {
+                        player.set_playing(true)
+                    } else if let Some((track, offset)) = ui.resume.take() {
+                        player.play_index_at(track, offset)
+                    } else if !ui.tracks.borrow().is_empty() {
+                        player.play_index(0)
+                    } else {
+                        return ApiResponse::error(409, "nothing loaded — POST /api/open first");
+                    }
+                }
+            };
+            match result {
+                Ok(()) => ApiResponse::ok(status_json(ui, player)),
+                Err(e) => ApiResponse::error(500, &e.to_string()),
+            }
+        }
+
+        ("/api/pause", _, true) => match player.set_playing(false) {
+            Ok(()) => ApiResponse::ok(status_json(ui, player)),
+            Err(e) => ApiResponse::error(500, &e.to_string()),
+        },
+
+        ("/api/playpause", _, true) => {
+            let result = if player.is_loaded() {
+                player.toggle_pause().map(|_| ())
+            } else if let Some((track, offset)) = ui.resume.take() {
+                player.play_index_at(track, offset)
+            } else if !ui.tracks.borrow().is_empty() {
+                player.play_index(0)
+            } else {
+                return ApiResponse::error(409, "nothing loaded — POST /api/open first");
+            };
+            match result {
+                Ok(()) => ApiResponse::ok(status_json(ui, player)),
+                Err(e) => ApiResponse::error(500, &e.to_string()),
+            }
+        }
+
+        ("/api/stop", _, true) => match player.stop() {
+            Ok(()) => ApiResponse::ok(status_json(ui, player)),
+            Err(e) => ApiResponse::error(500, &e.to_string()),
+        },
+
+        ("/api/next", _, true) => match player.next() {
+            Ok(()) => ApiResponse::ok(status_json(ui, player)),
+            Err(e) => ApiResponse::error(500, &e.to_string()),
+        },
+
+        ("/api/previous", _, true) => match player.previous() {
+            Ok(()) => ApiResponse::ok(status_json(ui, player)),
+            Err(e) => ApiResponse::error(500, &e.to_string()),
+        },
+
+        ("/api/seek", _, true) => {
+            if player.current().is_none() {
+                return ApiResponse::error(409, "nothing is playing");
+            }
+            let target = match (req.f64("position_secs"), req.f64("offset_secs")) {
+                (Some(p), _) => (p.max(0.0) * 1e9) as u64,
+                (None, Some(o)) => {
+                    let now = player.position() as f64;
+                    ((now + o * 1e9).max(0.0)) as u64
+                }
+                (None, None) => {
+                    return ApiResponse::error(400, "send position_secs or offset_secs")
+                }
+            };
+            player.seek(target);
+            ApiResponse::ok(status_json(ui, player))
+        }
+
+        ("/api/volume", _, true) => {
+            let Some(v) = req.f64("volume") else {
+                return ApiResponse::error(400, "send volume, 0.0 to 1.0");
+            };
+            // Move the slider, don't set the player: the slider's handler is what
+            // tells the player, repaints the icon and schedules the save.
+            ui.volume_scale.set_value(v.clamp(0.0, 1.0));
+            ApiResponse::ok(status_json(ui, player))
+        }
+
+        ("/api/repeat", _, true) => {
+            let Some(mode) = req.string("mode") else {
+                return ApiResponse::error(400, "send mode: off, all or one");
+            };
+            let repeat = match mode.as_str() {
+                "off" => Repeat::Off,
+                "all" => Repeat::All,
+                "one" => Repeat::One,
+                other => {
+                    return ApiResponse::error(400, &format!("unknown repeat mode {other:?} — use off, all or one"))
+                }
+            };
+            player.set_repeat(repeat);
+            ApiResponse::ok(status_json(ui, player))
+        }
+
+        ("/api/shuffle", _, true) => {
+            let Some(mode) = req.string("mode") else {
+                return ApiResponse::error(400, "send mode: off, on or favorites");
+            };
+            // `Shuffle::from_str` maps anything unknown to Off, which is right
+            // when reading a config file and wrong here — a typo in a script
+            // should be an error, not a silent mode change.
+            if !matches!(mode.as_str(), "off" | "on" | "favorites") {
+                return ApiResponse::error(400, &format!("unknown shuffle mode {mode:?} — use off, on or favorites"));
+            }
+            player.set_shuffle(Shuffle::from_str(&mode));
+            ApiResponse::ok(status_json(ui, player))
+        }
+
+        ("/api/rating", _, true) => {
+            let Some(stars) = req.u64("stars") else {
+                return ApiResponse::error(400, "send stars, 0 to 5 (0 clears)");
+            };
+            if stars > ratings::MAX as u64 {
+                return ApiResponse::error(400, "stars must be 0 to 5");
+            }
+            // By index, or by path for a caller that has one and does not want to
+            // search the queue for it.
+            let index = match (req.u64("index"), req.string("path")) {
+                (Some(i), _) => i as usize,
+                (None, Some(path)) => {
+                    let want = PathBuf::from(path);
+                    match ui.tracks.borrow().iter().position(|t| t.path == want) {
+                        Some(i) => i,
+                        None => return ApiResponse::error(404, "that path is not in the current queue"),
+                    }
+                }
+                // Neither: rate what is playing, which is what the star strip does.
+                (None, None) => match ui.focus.get() {
+                    Some(i) => i,
+                    None => return ApiResponse::error(409, "nothing is playing — send index or path"),
+                },
+            };
+            if index >= ui.tracks.borrow().len() {
+                return ApiResponse::error(404, "no track at that index");
+            }
+            apply_rating(ui, player, index, stars as u8);
+            let track = ui.tracks.borrow()[index].clone();
+            ApiResponse::ok(json!({ "ok": true, "track": track_json(index, &track) }))
+        }
+
+        ("/api/open", _, true) => {
+            let Some(path) = req.string("path") else {
+                return ApiResponse::error(400, "send path: a folder or a playlist file");
+            };
+            let path = PathBuf::from(path);
+            if !path.exists() {
+                return ApiResponse::error(404, "no such file or folder");
+            }
+            load_source(ui, player, path);
+            let count = ui.tracks.borrow().len();
+            if count == 0 {
+                // Not an error — an empty folder is a real answer — but say so
+                // rather than reporting a successful load of nothing.
+                return ApiResponse::ok(json!({
+                    "ok": true,
+                    "count": 0,
+                    "note": "loaded, but no playable tracks were found there"
+                }));
+            }
+            ApiResponse::ok(json!({ "ok": true, "count": count }))
+        }
+
+        ("/api/settings", true, _) => ApiResponse::ok(json!({
+            "ok": true,
+            "trim_silence": player.trim_silence(),
+            "crossfade_secs": player.crossfade() as f64 / 1e9,
+            "inner_silence_secs": player.inner_limit() as f64 / 1e9,
+        })),
+
+        ("/api/settings", _, true) => {
+            let mut changed = Vec::new();
+            // Each of these drives the widget, so the popover shows the truth the
+            // next time it is opened and the label under the slider updates too.
+            if let Some(on) = req.bool("trim_silence") {
+                if let Some(sw) = ui.trim_switch.borrow().as_ref() {
+                    sw.set_active(on);
+                } else {
+                    player.set_trim_silence(on);
+                }
+                changed.push("trim_silence");
+            }
+            if let Some(secs) = req.f64("crossfade_secs") {
+                if !(0.0..=10.0).contains(&secs) {
+                    return ApiResponse::error(400, "crossfade_secs must be 0 to 10");
+                }
+                match ui.xfade_scale.borrow().as_ref() {
+                    Some(scale) => scale.set_value(secs),
+                    None => player.set_crossfade((secs * 1e9) as u64),
+                }
+                changed.push("crossfade_secs");
+            }
+            if let Some(secs) = req.f64("inner_silence_secs") {
+                if !(0.0..=10.0).contains(&secs) {
+                    return ApiResponse::error(400, "inner_silence_secs must be 0 to 10");
+                }
+                match ui.inner_scale.borrow().as_ref() {
+                    Some(scale) => scale.set_value(secs),
+                    None => player.set_inner_limit((secs * 1e9) as u64),
+                }
+                changed.push("inner_silence_secs");
+            }
+            if changed.is_empty() {
+                return ApiResponse::error(400, "send at least one of trim_silence, crossfade_secs, inner_silence_secs");
+            }
+            ApiResponse::ok(json!({
+                "ok": true,
+                "changed": changed,
+                "trim_silence": player.trim_silence(),
+                "crossfade_secs": player.crossfade() as f64 / 1e9,
+                "inner_silence_secs": player.inner_limit() as f64 / 1e9,
+            }))
+        }
+
+        ("/api/autostart", true, _) => {
+            ApiResponse::ok(json!({ "ok": true, "enabled": autostart::is_enabled() }))
+        }
+
+        ("/api/autostart", _, true) => {
+            let Some(on) = req.bool("enabled") else {
+                return ApiResponse::error(400, "send enabled: true or false");
+            };
+            match autostart::set(on) {
+                Ok(()) => ApiResponse::ok(json!({ "ok": true, "enabled": autostart::is_enabled() })),
+                Err(e) => ApiResponse::error(500, &e.to_string()),
+            }
+        }
+
+        ("/api/quit", _, true) => {
+            save_settings(ui, player);
+            // Queued rather than immediate: the reply has to reach the caller
+            // before the process goes away, and we are inside the handler that
+            // produces it.
+            glib::idle_add_local_once(|| {
+                if let Some(app) = gtk::gio::Application::default() {
+                    app.quit();
+                }
+            });
+            ApiResponse::ok(json!({ "ok": true, "quitting": true }))
+        }
+
+        // A known route with the wrong verb is a different mistake from a route
+        // that does not exist, and saying so saves a round of guessing.
+        (path, _, _) if known_route(path) => ApiResponse::error(
+            405,
+            &format!("{} is not allowed on {path} — see GET /api", req.method),
+        ),
+        _ => ApiResponse::error(404, "no such endpoint — see GET /api"),
+    }
+}
+
+fn known_route(path: &str) -> bool {
+    matches!(
+        path,
+        "/api/docs"
+            | "/api/status"
+            | "/api/queue"
+            | "/api/play"
+            | "/api/pause"
+            | "/api/playpause"
+            | "/api/stop"
+            | "/api/next"
+            | "/api/previous"
+            | "/api/seek"
+            | "/api/volume"
+            | "/api/repeat"
+            | "/api/shuffle"
+            | "/api/rating"
+            | "/api/open"
+            | "/api/settings"
+            | "/api/autostart"
+            | "/api/quit"
+    )
+}
+
+fn track_json(index: usize, t: &Track) -> Value {
+    json!({
+        "index": index,
+        "title": t.title,
+        "artist": t.artist,
+        "album": t.album,
+        "year": t.year,
+        "genre": t.genre,
+        "disc": t.disc,
+        "track_no": t.track_no,
+        "duration_secs": t.duration_nanos as f64 / 1e9,
+        "format": t.format,
+        "rating": t.rating,
+        "path": t.path,
+    })
+}
+
+fn status_json(ui: &Rc<Ui>, player: &Arc<Player>) -> Value {
+    // The track shown in the now-playing panel: playing, paused, or merely cued
+    // from the last session. `focus` is exactly that, and it is what the rating
+    // endpoint defaults to, so status and rating agree on "the current track".
+    let current = ui.focus.get();
+    let track = current.and_then(|i| ui.tracks.borrow().get(i).cloned());
+
+    json!({
+        "ok": true,
+        "version": VERSION,
+        "playing": player.is_playing(),
+        "loaded": player.is_loaded(),
+        "position_secs": player.position() as f64 / 1e9,
+        "volume": player.volume(),
+        "repeat": match player.repeat() {
+            Repeat::Off => "off",
+            Repeat::All => "all",
+            Repeat::One => "one",
+        },
+        "shuffle": player.shuffle().as_str(),
+        "trim_silence": player.trim_silence(),
+        "crossfade_secs": player.crossfade() as f64 / 1e9,
+        "inner_silence_secs": player.inner_limit() as f64 / 1e9,
+        "queue_length": ui.tracks.borrow().len(),
+        "source": Settings::load().last_source,
+        "track": track.map(|t| track_json(current.unwrap_or(0), &t)),
+    })
+}
+
+/// `?` over `anyhow::Result` and an early `ApiResponse` do not mix in the one
+/// place `/api/play` needs both. This keeps that branch readable.
+trait IntoErr {
+    fn into_err(self) -> anyhow::Result<()>;
+}
+
+impl IntoErr for ApiResponse {
+    fn into_err(self) -> anyhow::Result<()> {
+        Err(anyhow::anyhow!(self
+            .body
+            .get("error")
+            .and_then(|v| v.as_str())
+            .unwrap_or("error")
+            .to_string()))
+    }
 }

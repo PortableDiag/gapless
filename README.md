@@ -50,6 +50,10 @@ both, and can crossfade instead if you'd rather.
   weighted towards the front. Measured, not asserted: over 4,000 passes of a
   12-track queue, 5-star tracks average slot 1.5 where a plain shuffle averages
   5.5.
+- **A local control API** — HTTP and JSON on 127.0.0.1, key-authenticated, off
+  until you switch it on. It does everything the window does, so an agent or a
+  script can drive the player. `GET /api/docs` serves the full reference from
+  the running build. See **[docs/API.md](docs/API.md)**.
 - Repeat off/all/one, shuffle, ReplayGain, MPRIS2 (media keys + lock screen) —
   and a mode toggled from the lock screen or `playerctl` repaints the buttons and
   is saved, exactly as a click on them would be.
@@ -126,6 +130,7 @@ Two more checks, each written after a real bug got past the ones above:
 ./scripts/verify-resume.sh       # a track resumed part-way in must still hand off
 ./scripts/verify-mpris-modes.sh  # a mode set over D-Bus must survive a SIGKILL,
                                  # and must not downgrade favorites shuffle
+./scripts/verify-api.sh          # 41 checks over a real socket against the real app
 ```
 
 The weighted shuffle is measured by the unit tests, which print the distribution
@@ -140,12 +145,25 @@ Those two launch the real application, so they need a display — prefix them wi
 terminal. `verify.sh` renders through the engine with the audio sink swapped out
 and needs nothing.
 
+## Driving it from something else
+
+```sh
+KEY=$(gapless --api-key)
+curl -s -H "Authorization: Bearer $KEY" http://127.0.0.1:8421/api/status
+```
+
+Switch it on under the gear button → **Remote control API**. It binds to loopback
+only and every route needs the key. The whole reference is
+**[docs/API.md](docs/API.md)**, and the running build serves its own copy at
+`GET /api/docs` — so pointing an agent at the port is enough.
+
 ## Documentation
 
 | | |
 |---|---|
 | **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** | How the engine works, and the three approaches that failed first |
 | **[docs/VERIFICATION.md](docs/VERIFICATION.md)** | How the gapless claim is proved rather than asserted |
+| **[docs/API.md](docs/API.md)** | The control API — enabling it, the key, every endpoint |
 | **[docs/DEVELOPING.md](docs/DEVELOPING.md)** | Layout, the tools in `examples/`, gotchas |
 | **[CHANGELOG.md](CHANGELOG.md)** | What changed, when |
 

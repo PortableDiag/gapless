@@ -5,6 +5,74 @@ All notable changes to Gapless. Newest first.
 The project is pre-1.0; entries are grouped by release and carry the commit
 that made them.
 
+## v0.3.0 — 2026-09-13
+
+### Added
+
+- **A local control API.** HTTP and JSON on `127.0.0.1`, so an agent or another
+  program can do everything the window does: load a folder or a playlist, play,
+  pause, seek, skip, change every mode, rate a track, change the three playback
+  settings, and quit. **Off by default**, switched on under the gear button →
+  *Remote control API*, with the port and the key beside the switch.
+
+  **[docs/API.md](docs/API.md) is the reference**, and the running build serves
+  its own copy at **`GET /api/docs`** (`?section=` narrows it) — compiled in with
+  `include_str!`, so the document can never describe a different version than the
+  one answering you. `GET /api` is a one-line index of every route. Pointing
+  something at the port and the key is enough to get it started.
+
+  Why not MPRIS, which already exists: it is the right interface for media keys
+  and a lock screen and the wrong one for scripting. A caller needs a D-Bus
+  connection and bindings; the vocabulary is fixed by the spec, so silence
+  trimming, crossfade length, the interior-silence cap, ratings and favorites
+  shuffle have nowhere to live in it; and its `Shuffle` is a bool where this
+  player has three states. MPRIS is unchanged.
+
+  **Security.** Loopback only, never a wildcard address. Every route needs the
+  key — there is no unauthenticated endpoint, not even a health check, because
+  an unauthenticated endpoint is a way to discover the player is there and there
+  is nothing useful it could tell a caller who has no key. The key is 32 bytes
+  from `/dev/urandom`, hex, in `~/.config/gapless/api-key` at mode 0600, and is
+  compared in **constant time** — a plain `==` returns at the first differing
+  byte, which over enough requests hands the key over one byte at a time.
+  `gapless --api-key` prints it without opening a window, because asking the API
+  for its own key is not a plan that goes anywhere.
+
+  **One player, not two copies of the state.** Requests are parsed on the
+  listener's threads and executed on the GTK main thread, in the same place a
+  button click runs — so commands cannot interleave halfway through a queue
+  change, and an API call moves the same widgets a click does. Setting the
+  volume moves the slider; the slider's own handler is what tells the engine,
+  repaints the icon and schedules the save.
+
+  `POST /api/quit` saves the session before exiting, and replies before it goes.
+
+- **`scripts/verify-api.sh`** — 41 checks over a real socket against the real
+  application, on a private bus, a private config directory and a high port, with
+  the volume set to zero first so the run is silent. It covers what is most
+  likely to be quietly wrong: that an absent key and a wrong key are both
+  refused, that an **unauthorised write changes nothing**, that a typo in a mode
+  is rejected rather than obeyed, that a rating reaches the sidecar file, that
+  modes reach `state.json` after a **SIGKILL**, and that nothing answers on the
+  port when the switch is off.
+
+### Fixed
+
+- **Loading a folder could hang the whole application** — introduced with the
+  rating context menu in v0.2.0 and found by the new API harness rather than by
+  using the app.
+
+  `load_source` cleared the list with `while let Some(row) = list.first_child()`.
+  A `GtkListBox`'s children are not all rows: the rating popover is parented to
+  it, so once the rows were gone `first_child()` returned the popover for ever,
+  `remove` refused it as a non-child, and the loop span. The window froze and
+  GTK emitted **5.8 million** `Tried to remove non-child` warnings in a few
+  seconds. It now uses `row_at_index(0)`, which only ever returns real rows.
+
+  Worth recording because of how it surfaced: through the UI the symptom needs a
+  second Open Folder after a right-click, which is why it survived a manual pass.
+  The API harness hit it on its first `POST /api/open`.
+
 ## v0.2.0 — 2026-09-13
 
 ### Added

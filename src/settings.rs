@@ -39,6 +39,11 @@ pub struct Settings {
     /// than not resuming at all.
     pub last_track: Option<PathBuf>,
     pub last_position_secs: f64,
+    /// The local HTTP control API. Off by default: a control socket nobody asked
+    /// for should not appear because somebody installed a music player.
+    pub api_enabled: bool,
+    /// Port for that API, on 127.0.0.1. See `api::DEFAULT_PORT`.
+    pub api_port: u16,
 }
 
 impl Default for Settings {
@@ -55,6 +60,8 @@ impl Default for Settings {
             inner_silence_secs: 0.0,
             last_track: None,
             last_position_secs: 0.0,
+            api_enabled: false,
+            api_port: crate::api::DEFAULT_PORT,
         }
     }
 }
