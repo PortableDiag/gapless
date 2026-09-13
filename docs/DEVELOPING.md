@@ -65,6 +65,15 @@ stale timestamp makes `audiomixer` discard the whole rewritten timeline.
 branch's data long before that branch is audible. Derive the current track from
 the playback position.
 
+**The harness shares the operator's desktop.** `verify.sh` and
+`verify-resume.sh` render through the `capture` example and are invisible.
+`verify-api.sh` and `verify-mpris-modes.sh` launch the app, so a window appears —
+they wait for an idle machine first (`scripts/wait-for-idle.sh`, backed by
+`xprintidle`), overridable with `GAPLESS_WINDOWS_OK=1`. `verify-input.sh` takes
+the **pointer and keyboard**, so it will not run without `GAPLESS_INPUT_OK=1`,
+and yields the moment a real keypress arrives. Printing `[SKIP]` and exiting 0 is
+its normal behaviour, not a fault.
+
 **Three of the five checks need a display.** `verify-mpris-modes.sh`,
 `verify-api.sh` and `verify-input.sh` launch the real application — from a
 desktop terminal you never notice, but over ssh, from cron, or from a tool that

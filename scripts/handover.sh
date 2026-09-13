@@ -115,8 +115,13 @@ fi
 # inherently scoped to the instance being handed over: a private bus has no
 # owner for the MPRIS name unless the private player owns it.
 if [ "$OLD_VIA" = "api" ]; then
+  # `pid` arrived in v0.5.1. An OLDER player answers its API perfectly well and
+  # simply has no such field, so the API path must fall through to the bus rather
+  # than refuse — otherwise the handover cannot retire exactly the versions it is
+  # most needed for: the ones being replaced because they are out of date.
   OLD_PID=$(printf '%s' "$SNAP" | jq_ 'd.get("pid","")')
-else
+fi
+if [ -z "${OLD_PID:-}" ]; then
   # One step: GetConnectionUnixProcessID takes a well-known name directly, so
   # there is no owner string to parse. (Parsing one is how this first went
   # wrong: `grep -oP "'\K[^']+"` matches TWICE on `(':1.2356',)` — the closing

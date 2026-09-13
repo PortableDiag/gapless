@@ -137,7 +137,8 @@ Four more checks, each written after a real bug got past the ones above:
 DISPLAY=:0 ./scripts/verify-mpris-modes.sh  # a mode set over D-Bus must survive a SIGKILL, must
                                             # not downgrade favorites shuffle, and Play must resume
 DISPLAY=:0 ./scripts/verify-api.sh          # 51 checks over a real socket against the real app
-DISPLAY=:0 ./scripts/verify-input.sh        # the rating keys and the right-click menu, real input
+DISPLAY=:0 GAPLESS_INPUT_OK=1 \
+  ./scripts/verify-input.sh      # the rating keys and the right-click menu, real input
 ```
 
 The weighted shuffle is measured by the unit tests, which print the distribution
@@ -146,6 +147,15 @@ rather than only asserting its direction:
 ```sh
 cargo test -- --nocapture
 ```
+
+**These scripts share your desktop, so they behave themselves.** `verify-api.sh`
+and `verify-mpris-modes.sh` open a window, so they wait for the machine to be
+idle first (`GAPLESS_WINDOWS_OK=1` to go anyway). `verify-input.sh` drives the
+real pointer and keyboard — GTK4 ignores synthetic key events, so there is no
+other way to test them — and therefore **refuses to run at all** unless you set
+`GAPLESS_INPUT_OK=1`; even then it waits for a quiet keyboard and abandons its
+run the moment you touch a key. `verify.sh` and `verify-resume.sh` touch nothing
+and can run whenever.
 
 **Three of the five need a display**, because they launch the real application:
 `verify-mpris-modes.sh`, `verify-api.sh` and `verify-input.sh`. Prefix those with

@@ -5,6 +5,90 @@ All notable changes to Gapless. Newest first.
 The project is pre-1.0; entries are grouped by release and carry the commit
 that made them.
 
+## Unreleased
+
+### Fixed
+
+- **`handover.sh` could not retire a player older than v0.5.1.** The outgoing
+  pid comes from `GET /api/status`'s `pid` field, which only exists from v0.5.1 —
+  an older player answers its API perfectly well and simply has no such field, so
+  the lookup came back empty and the handover refused. That is precisely the case
+  the tool is most needed for: the versions being replaced *because* they are out
+  of date. The API path now falls through to the bus lookup, which works on any
+  version. (It refusing rather than guessing was correct and is kept — it simply
+  had one route too few.)
+
+### Documentation
+
+- The harness's **desktop etiquette** is now written down in `README.md` and
+  `docs/DEVELOPING.md`: which scripts open a window, which take the keyboard, and
+  how they are gated. It is not discoverable otherwise — `verify-input.sh` now
+  prints `[SKIP]` and exits 0 by default, which looks like a broken script if you
+  do not know it is deliberate.
+
+  Tooling and documentation only — **no version bump and no tag.** No
+  application code changed, and publishing an identical binary would push a
+  pointless "update available" to every install.
+
+## v0.5.1 — 2026-09-13
+
+### Fixed
+
+- **The control API could be killed by regenerating its own key.** Pressing
+  **Regenerate** in the settings popover restarts the listener on the same port.
+  `Server::drop` fired its wake-up connection and returned **without waiting for
+  the accept thread to exit**, so the old listening socket was still open when
+  the new bind ran: `Address already in use`, and the control API stayed **dead**
+  until the app was restarted.
+
+  `SO_REUSEADDR` does not help — the old socket is *live*, not in `TIME_WAIT`.
+  `Drop` now joins the accept thread, so the socket is provably closed before
+  anything rebinds. This shipped in v0.4.0 and took the operator's API down the
+  first time they pressed the button.
+
+- **`scripts/handover.sh` used `pgrep` to find the outgoing player.** `pgrep`
+  matches by name across the **whole machine**, so it escapes a private D-Bus
+  session and a private `XDG_CONFIG_HOME` without noticing. Run against test
+  binaries inside what looked like a sandbox, it found the real player and
+  **SIGTERMed it mid-song.**
+
+  The outgoing pid now comes from the API's own `pid` field or from
+  `GetConnectionUnixProcessID` on the bus in use — both inherently scoped to the
+  instance being handed over, because a private bus has no owner for the MPRIS
+  name unless the private player owns it. If neither answers, it **refuses rather
+  than guessing**.
+
+### Added
+
+- **`pid` in `GET /api/status`**, so a caller can act on *that* process instead
+  of searching for one by name.
+
+- **`handover.sh` falls back to MPRIS** when the outgoing player's control API is
+  not answering — which is exactly the state the listener bug above leaves it in,
+  and the moment a handover is most needed. Verified at a **49 ms** overlap. It
+  identifies the track by **file path** rather than queue index in that mode,
+  because an index is only meaningful against one queue.
+
+- **`scripts/wait-for-idle.sh`** and desktop gating for the whole harness. Some
+  checks have to open a window or take the keyboard; doing that while somebody is
+  working means two parties fighting over one input queue, and both lose.
+
+  | script | opens a window | takes input | gate |
+  |---|---|---|---|
+  | `verify.sh` | no | no | none needed |
+  | `verify-resume.sh` | no | no | none needed |
+  | `verify-api.sh` | yes | no | waits for an idle desk; `GAPLESS_WINDOWS_OK=1` overrides |
+  | `verify-mpris-modes.sh` | yes | no | same |
+  | `verify-input.sh` | yes | **yes** | **will not run at all** without `GAPLESS_INPUT_OK=1`; then waits for a quiet keyboard, and **abandons the run the instant a real keypress arrives** |
+
+  Idle time comes from `xprintidle`, or the XScreenSaver extension directly when
+  it is not installed.
+
+- `handover.sh` keeps the replacement's **stderr** in a log instead of discarding
+  it. A managed restart that throws it away leaves nothing to read when the
+  replacement comes up silent — which has happened, and cost two minutes of
+  diagnosis starting from zero.
+
 ## v0.5.0 — 2026-09-13
 
 ### Added
