@@ -64,18 +64,27 @@ stale timestamp makes `audiomixer` discard the whole rewritten timeline.
 branch's data long before that branch is audible. Derive the current track from
 the playback position.
 
-**Two of the three checks need a display.** `verify-resume.sh` and
-`verify-mpris-modes.sh` launch the real application — from a desktop terminal you
-never notice, but over ssh, from cron, or from a tool that doesn't inherit the
-session environment, `DISPLAY` is unset and they fail in a way that doesn't
-mention a display:
+**Three of the five checks need a display.** `verify-mpris-modes.sh`,
+`verify-api.sh` and `verify-input.sh` launch the real application — from a
+desktop terminal you never notice, but over ssh, from cron, or from a tool that
+doesn't inherit the session environment, `DISPLAY` is unset and they fail in a
+way that doesn't mention a display:
 
 ```sh
 DISPLAY=:0 ./scripts/verify-mpris-modes.sh
+DISPLAY=:0 ./scripts/verify-api.sh
+DISPLAY=:0 ./scripts/verify-input.sh
 ```
 
-`verify.sh` is genuinely headless — it renders through the `capture` example with
-the audio sink swapped out — and needs nothing.
+**Three of the five need one**, and they are exactly the three that launch the
+real GTK application. `verify.sh` **and `verify-resume.sh`** are genuinely
+headless — both drive the engine through the `capture` example with the audio
+sink swapped out, and need nothing.
+
+`verify-resume.sh` was documented here as needing a display from 2026-08-04
+until it was actually tested: it runs `cargo run --example capture`, never the
+GTK app, and passes 4/4 with `DISPLAY` unset. The original note was written
+from the two scripts' names rather than their contents.
 
 Two things that look like failures and aren't. `verify-mpris-modes.sh` re-execs
 itself under `dbus-run-session`, which starts its own xdg-desktop-portal: the

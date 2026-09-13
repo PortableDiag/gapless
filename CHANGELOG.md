@@ -5,6 +5,34 @@ All notable changes to Gapless. Newest first.
 The project is pre-1.0; entries are grouped by release and carry the commit
 that made them.
 
+## Unreleased
+
+### Documentation
+
+- **`verify-resume.sh` never needed a display, and five releases of documentation
+  said it did.** The v0.2.0 notes below, `README.md` and `docs/DEVELOPING.md` all
+  claimed it launches the real application. It does not — it runs
+  `cargo run --example capture`, the same headless path `verify.sh` uses, and it
+  passes **4/4 with `DISPLAY` unset**, which is how this was settled rather than
+  argued.
+
+  The original note was written from the two scripts' *names* rather than their
+  contents, and nothing re-checked it because the claim only costs you anything
+  in a headless shell — where you would blame the missing display and move on.
+
+  The harness has also grown since: it is **five** scripts now, not three, and
+  **three** of them need a display — `verify-mpris-modes.sh`, `verify-api.sh` and
+  `verify-input.sh`, which are exactly the three that launch the real GTK
+  application. `verify.sh` and `verify-resume.sh` are both genuinely headless.
+
+- The README's feature list now names the whole command line — `--version`,
+  `--api-key`, and `--new-instance` / `--api-port` — rather than `--version`
+  alone.
+
+  Documentation only — **no version bump and no tag.** No application code
+  changed, and publishing an identical binary would push a pointless "update
+  available" to every install.
+
 ## v0.4.0 — 2026-09-13
 
 ### Added

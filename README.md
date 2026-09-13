@@ -63,8 +63,9 @@ both, and can crossfade instead if you'd rather.
   track and position you stopped at. Cued up, not auto-played.
 - **Start at login** — a switch in the settings popover, no fiddling with
   `~/.config/autostart` by hand.
-- **About dialog**, and `gapless --version` for asking an installed copy what it
-  is without opening a window.
+- **About dialog**, and a command line that answers without opening a window:
+  `--version`, `--api-key`, and `--new-instance` / `--api-port` for running a
+  second copy alongside the first.
 
 ## Install
 
@@ -124,14 +125,14 @@ for you if `testdata/` is missing or incomplete.
 See **[docs/VERIFICATION.md](docs/VERIFICATION.md)** for how and why, including
 why the obvious way to test this is wrong.
 
-Two more checks, each written after a real bug got past the ones above:
+Four more checks, each written after a real bug got past the ones above:
 
 ```sh
-./scripts/verify-resume.sh       # a track resumed part-way in must still hand off
-./scripts/verify-mpris-modes.sh  # a mode set over D-Bus must survive a SIGKILL, must not
-                                 # downgrade favorites shuffle, and Play must resume
-./scripts/verify-api.sh          # 44 checks over a real socket against the real app
-./scripts/verify-input.sh        # the rating keys and the right-click menu, real input
+./scripts/verify-resume.sh                  # a track resumed part-way in must still hand off
+DISPLAY=:0 ./scripts/verify-mpris-modes.sh  # a mode set over D-Bus must survive a SIGKILL, must
+                                            # not downgrade favorites shuffle, and Play must resume
+DISPLAY=:0 ./scripts/verify-api.sh          # 44 checks over a real socket against the real app
+DISPLAY=:0 ./scripts/verify-input.sh        # the rating keys and the right-click menu, real input
 ```
 
 The weighted shuffle is measured by the unit tests, which print the distribution
@@ -141,10 +142,14 @@ rather than only asserting its direction:
 cargo test -- --nocapture
 ```
 
-Those two launch the real application, so they need a display — prefix them with
-`DISPLAY=:0` if you are running over ssh or from anything that isn't a desktop
-terminal. `verify.sh` renders through the engine with the audio sink swapped out
-and needs nothing.
+**Three of the five need a display**, because they launch the real application:
+`verify-mpris-modes.sh`, `verify-api.sh` and `verify-input.sh`. Prefix those with
+`DISPLAY=:0` over ssh or from anything that doesn't inherit a desktop session.
+
+`verify.sh` **and `verify-resume.sh`** are genuinely headless — both render
+through the `capture` example with the audio sink swapped out, and need nothing.
+(`verify-resume.sh` was documented as needing a display for five releases. It
+does not; it was measured with `DISPLAY` unset and passes 4/4.)
 
 ## Driving it from something else
 
