@@ -11,6 +11,7 @@ src/
   playlist.rs  M3U / M3U8 / PLS
   mpris.rs     MPRIS2 — media keys, lock screen
   settings.rs  ~/.config/gapless/state.json
+  ratings.rs   ~/.config/gapless/ratings.json — star ratings, 1–5
 examples/      diagnostic tools (below)
 scripts/       setup, test-signal generation, verification
 ```

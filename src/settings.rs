@@ -18,7 +18,14 @@ pub struct Settings {
     pub volume: f64,
     /// "off" | "all" | "one"
     pub repeat: String,
+    /// Superseded by `shuffle_mode`, which has three states rather than two.
+    /// Still written on every save — an older build, or `verify-mpris-modes.sh`,
+    /// reads this key and nothing else — and still read when `shuffle_mode` is
+    /// absent, so a config written before favorites shuffle existed migrates
+    /// instead of silently turning shuffle off.
     pub shuffle: bool,
+    /// "off" | "on" | "favorites". `None` means this config predates the field.
+    pub shuffle_mode: Option<String>,
     /// Skip silence recorded at track edges. On by default: it is what makes a
     /// non-gapless rip sound gapless, and it is what most people actually want.
     pub trim_silence: bool,
@@ -42,6 +49,7 @@ impl Default for Settings {
             volume: 1.0,
             repeat: "off".into(),
             shuffle: false,
+            shuffle_mode: None,
             trim_silence: true,
             crossfade_secs: 0.0,
             inner_silence_secs: 0.0,
@@ -75,6 +83,23 @@ impl Settings {
                 eprintln!("could not save settings: {e}");
             }
         }
+    }
+
+    /// The two shuffle keys reconciled: the three-state one wins when present,
+    /// the old bool stands in when it is not. Returned as text so `settings` does
+    /// not have to depend on `player`.
+    pub fn shuffle_mode_str(&self) -> &str {
+        match self.shuffle_mode.as_deref() {
+            Some(m) => m,
+            None if self.shuffle => "on",
+            None => "off",
+        }
+    }
+
+    /// Sets both keys from the three-state value, so they can never disagree.
+    pub fn set_shuffle_mode(&mut self, mode: &str) {
+        self.shuffle = mode != "off";
+        self.shuffle_mode = Some(mode.to_string());
     }
 
     /// A remembered source that has since been unmounted or deleted must not
@@ -112,6 +137,34 @@ mod tests {
         assert_eq!(s.crossfade_secs, 3.0);
         assert_eq!(s.last_track, None);
         assert_eq!(s.last_position_secs, 0.0);
+    }
+
+    /// The migration that matters: a config from before favorites shuffle has
+    /// only the bool. `shuffle: true` must come back as plain shuffle, not as
+    /// "off" — the failure mode of adding a new field and reading only that one.
+    #[test]
+    fn old_bool_shuffle_migrates_to_a_mode() {
+        let old = r#"{ "shuffle": true }"#;
+        let s: Settings = serde_json::from_str(old).unwrap();
+        assert_eq!(s.shuffle_mode_str(), "on");
+
+        let off = r#"{ "shuffle": false }"#;
+        let s: Settings = serde_json::from_str(off).unwrap();
+        assert_eq!(s.shuffle_mode_str(), "off");
+    }
+
+    /// And the other direction: the bool must keep being written, because
+    /// `verify-mpris-modes.sh` and any older install read that key alone.
+    #[test]
+    fn setting_a_mode_keeps_the_old_bool_in_step() {
+        let mut s = Settings::default();
+        s.set_shuffle_mode("favorites");
+        assert!(s.shuffle, "the legacy bool must say shuffle is on");
+        assert_eq!(s.shuffle_mode_str(), "favorites");
+
+        s.set_shuffle_mode("off");
+        assert!(!s.shuffle);
+        assert_eq!(s.shuffle_mode_str(), "off");
     }
 
     #[test]

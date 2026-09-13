@@ -47,7 +47,7 @@ pub enum PlayerEvent {
     /// Repeat or shuffle changed. Unlike the transport events these do not move
     /// the pipeline, so nothing else would tell the UI they happened — and they
     /// can originate from MPRIS as easily as from a button.
-    ModesChanged { repeat: Repeat, shuffle: bool },
+    ModesChanged { repeat: Repeat, shuffle: Shuffle },
     QueueFinished,
     Error(String),
 }
@@ -69,11 +69,78 @@ impl Repeat {
     }
 }
 
+/// Three states, not two. `Favorites` is still a shuffle — every track plays
+/// exactly once per pass — but the *order* is drawn with the higher-rated tracks
+/// weighted towards the front. It is not a filter: a 1-star track can still come
+/// up, just rarely, which is the difference between "prefer favorites" and "play
+/// only favorites".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Shuffle {
+    Off,
+    On,
+    Favorites,
+}
+
+impl Shuffle {
+    pub fn cycle(self) -> Self {
+        match self {
+            Shuffle::Off => Shuffle::On,
+            Shuffle::On => Shuffle::Favorites,
+            Shuffle::Favorites => Shuffle::Off,
+        }
+    }
+
+    pub fn is_on(self) -> bool {
+        self != Shuffle::Off
+    }
+
+    /// For `state.json` and anywhere else this has to survive as text.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Shuffle::Off => "off",
+            Shuffle::On => "on",
+            Shuffle::Favorites => "favorites",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Self {
+        match s {
+            "on" => Shuffle::On,
+            "favorites" => Shuffle::Favorites,
+            _ => Shuffle::Off,
+        }
+    }
+}
+
+/// How much more likely a rating makes a track to land early in a favorites
+/// shuffle. Doubling per star, with unrated sitting at 2 — the same as a 2-star
+/// track, because "I have not judged this" is not the same statement as "I do
+/// not like this" and should not be punished like one.
+///
+/// The ramp is steep on purpose. With linear weights (5 stars = 5, unrated = 1)
+/// a real library — which is overwhelmingly unrated — buries its handful of
+/// 5-star tracks under sheer volume, and the mode does nothing you can hear.
+/// Doubling makes a 5-star track 8× as likely as an unrated one to come up next
+/// and 16× a 1-star, which is visible in a single pass.
+pub fn weight_for(stars: u8) -> f64 {
+    match stars {
+        1 => 1.0,
+        2 => 2.0,
+        3 => 4.0,
+        4 => 8.0,
+        5 => 16.0,
+        _ => 2.0,
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct QueuedTrack {
     pub path: PathBuf,
     /// From the file's tags. Stands in until the silence analysis lands.
     pub duration_nanos: u64,
+    /// 1–5, or 0 for unrated. Read from the ratings sidecar, not from the file —
+    /// see `src/ratings.rs`. The engine only cares about it for `Shuffle::Favorites`.
+    pub rating: u8,
 }
 
 struct Queue {
@@ -81,7 +148,7 @@ struct Queue {
     order: Vec<usize>,
     slot_of: Vec<usize>,
     repeat: Repeat,
-    shuffle: bool,
+    shuffle: Shuffle,
 }
 
 impl Queue {
@@ -119,8 +186,16 @@ impl Queue {
     fn reorder(&mut self, keep_first: Option<usize>) {
         let len = self.tracks.len();
         self.order = (0..len).collect();
-        if self.shuffle {
-            shuffle_in_place(&mut self.order);
+        if self.shuffle.is_on() {
+            let mut rng = Rng::from_clock();
+            match self.shuffle {
+                Shuffle::Favorites => {
+                    let weights: Vec<f64> =
+                        self.tracks.iter().map(|t| weight_for(t.rating)).collect();
+                    weighted_shuffle_in_place(&mut self.order, &weights, &mut rng);
+                }
+                _ => shuffle_in_place(&mut self.order, &mut rng),
+            }
             if let Some(cur) = keep_first {
                 if let Some(at) = self.order.iter().position(|&t| t == cur) {
                     self.order.swap(0, at);
@@ -262,7 +337,7 @@ impl Player {
             order: Vec::new(),
             slot_of: Vec::new(),
             repeat: Repeat::Off,
-            shuffle: false,
+            shuffle: Shuffle::Off,
         }));
 
         let bus_watch = watch_bus(&pipeline, tx.clone())?;
@@ -309,7 +384,7 @@ impl Player {
         self.queue.lock().unwrap().repeat
     }
 
-    pub fn set_shuffle(&self, shuffle: bool) {
+    pub fn set_shuffle(&self, shuffle: Shuffle) {
         let keep = self.sched.lock().unwrap().current;
         let repeat = {
             let mut q = self.queue.lock().unwrap();
@@ -322,12 +397,23 @@ impl Player {
 
     /// Callers are on the GTK main thread and the channel is unbounded, so this
     /// cannot block; a closed channel just means we are shutting down.
-    fn emit_modes(&self, repeat: Repeat, shuffle: bool) {
+    fn emit_modes(&self, repeat: Repeat, shuffle: Shuffle) {
         let _ = self.tx.try_send(PlayerEvent::ModesChanged { repeat, shuffle });
     }
 
-    pub fn shuffle(&self) -> bool {
+    pub fn shuffle(&self) -> Shuffle {
         self.queue.lock().unwrap().shuffle
+    }
+
+    /// A rating changed. Stored on the queued track so the *next* favorites
+    /// reshuffle sees it; the order in flight is deliberately left alone —
+    /// resequencing the queue under the user because they clicked a star is not
+    /// what clicking a star means.
+    pub fn set_rating(&self, track: usize, stars: u8) {
+        let mut q = self.queue.lock().unwrap();
+        if let Some(t) = q.tracks.get_mut(track) {
+            t.rating = stars;
+        }
     }
 
     pub fn current(&self) -> Option<usize> {
@@ -1167,17 +1253,86 @@ fn watch_bus(
     Ok(guard)
 }
 
-fn shuffle_in_place(v: &mut [usize]) {
-    let mut state = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0x9E37_79B9_7F4A_7C15)
-        | 1;
+/// xorshift64. Not cryptographic and does not need to be — it decides what song
+/// plays next. Pulled out of `shuffle_in_place` so the weighted shuffle can share
+/// it and so the tests can seed it and get a reproducible order; a shuffle whose
+/// distribution cannot be measured is a shuffle nobody can claim anything about.
+struct Rng(u64);
+
+impl Rng {
+    fn from_clock() -> Self {
+        Rng(std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0x9E37_79B9_7F4A_7C15)
+            | 1)
+    }
+
+    #[cfg(test)]
+    fn seeded(seed: u64) -> Self {
+        Rng(seed | 1)
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0
+    }
+
+    /// Half-open (0, 1) — never exactly 0, because the weighted shuffle takes its
+    /// logarithm.
+    fn next_f64(&mut self) -> f64 {
+        // 53 bits is the mantissa; +1 keeps it off zero.
+        ((self.next_u64() >> 11) + 1) as f64 / (1u64 << 53) as f64
+    }
+}
+
+fn shuffle_in_place(v: &mut [usize], rng: &mut Rng) {
     for i in (1..v.len()).rev() {
-        state ^= state << 13;
-        state ^= state >> 7;
-        state ^= state << 17;
-        v.swap(i, (state % (i as u64 + 1)) as usize);
+        v.swap(i, (rng.next_u64() % (i as u64 + 1)) as usize);
+    }
+}
+
+/// Weighted shuffle without replacement: every track still appears exactly once,
+/// but a heavier track is proportionally more likely to land early.
+///
+/// The method is Efraimidis–Spirakis: give each item the key `u^(1/w)` for
+/// `u` uniform on (0,1), then sort by key descending. That draws exactly the same
+/// distribution as repeatedly picking from the remaining items with probability
+/// proportional to weight, in one O(n log n) pass instead of n quadratic draws.
+///
+/// It is computed in log space — `ln(u)/w`, sorted ascending, which orders
+/// identically — because `u^(1/16)` on a 10,000-track queue pushes a lot of keys
+/// into the same handful of floats near 1.0 and the sort stops distinguishing
+/// them. The logarithm keeps them apart.
+///
+/// `weights` is indexed by **track**, while `v` holds track indices, so the two
+/// are not parallel arrays; a zero or negative weight takes the smallest possible
+/// key and sinks to the back, rather than dividing by zero.
+fn weighted_shuffle_in_place(v: &mut [usize], weights: &[f64], rng: &mut Rng) {
+    let mut keyed: Vec<(f64, usize)> = v
+        .iter()
+        .map(|&track| {
+            let w = weights.get(track).copied().unwrap_or(1.0);
+            let key = if w > 0.0 {
+                rng.next_f64().ln() / w
+            } else {
+                f64::NEG_INFINITY
+            };
+            (key, track)
+        })
+        .collect();
+
+    // Descending. ln(u) is negative, so dividing by a larger weight moves the key
+    // *towards* zero — the heaviest tracks hold the largest keys, and largest
+    // first is what the method selects. Sorting these ascending is an easy and
+    // completely silent inversion: the queue still shuffles, it just prefers the
+    // tracks you rated worst. Two tests below measure the direction for that
+    // reason rather than only checking it is a permutation.
+    keyed.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    for (slot, (_, track)) in keyed.into_iter().enumerate() {
+        v[slot] = track;
     }
 }
 
@@ -1196,4 +1351,174 @@ pub fn uri_for(path: &Path) -> String {
     glib::filename_to_uri(&absolute, None)
         .map(|s| s.to_string())
         .unwrap_or_else(|_| format!("file://{}", absolute.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Builds the order the way `Queue::reorder` does, but from a seeded Rng so
+    /// the result can be measured rather than asserted.
+    fn favorites_order(ratings: &[u8], rng: &mut Rng) -> Vec<usize> {
+        let weights: Vec<f64> = ratings.iter().map(|&r| weight_for(r)).collect();
+        let mut order: Vec<usize> = (0..ratings.len()).collect();
+        weighted_shuffle_in_place(&mut order, &weights, rng);
+        order
+    }
+
+    /// The thing that would make this feature silently worthless: a weighted
+    /// shuffle that drops or duplicates tracks. Every pass must still be a
+    /// permutation — favorites shuffle is an ordering, not a filter.
+    #[test]
+    fn favorites_shuffle_is_still_a_permutation() {
+        let ratings = [5, 0, 1, 3, 0, 5, 2, 0, 4, 0, 0, 1];
+        let mut rng = Rng::seeded(0xDEAD_BEEF);
+        for _ in 0..200 {
+            let order = favorites_order(&ratings, &mut rng);
+            let mut seen = order.clone();
+            seen.sort_unstable();
+            assert_eq!(seen, (0..ratings.len()).collect::<Vec<_>>());
+        }
+    }
+
+    /// The claim the mode is named after, measured: over many passes, 5-star
+    /// tracks must land meaningfully earlier than unrated ones, and 1-star
+    /// tracks later. A uniform shuffle puts every mean at (n-1)/2 = 5.5 here, so
+    /// a broken weighting shows up as three numbers that are all the same.
+    #[test]
+    fn favorites_shuffle_actually_prefers_favorites() {
+        //            0  1  2  3  4  5  6  7  8  9 10 11
+        let ratings = [5, 5, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1];
+        let mut rng = Rng::seeded(0x5EED_1234);
+
+        const PASSES: usize = 4000;
+        let mut total_slot = vec![0usize; ratings.len()];
+        for _ in 0..PASSES {
+            for (slot, &track) in favorites_order(&ratings, &mut rng).iter().enumerate() {
+                total_slot[track] += slot;
+            }
+        }
+        let mean = |t: usize| total_slot[t] as f64 / PASSES as f64;
+
+        let five = (mean(0) + mean(1)) / 2.0;
+        let unrated = (2..=9).map(mean).sum::<f64>() / 8.0;
+        let one = (mean(10) + mean(11)) / 2.0;
+
+        // Printed, not just asserted: `cargo test -- --nocapture` shows the
+        // actual spread, so a weighting that is technically in the right
+        // direction but far too weak to hear is visible rather than passing.
+        println!(
+            "favorites shuffle, mean slot of 12 over {PASSES} passes \
+             (uniform would be 5.50):  5-star {five:.2}   unrated {unrated:.2}   1-star {one:.2}"
+        );
+
+        assert!(
+            five < unrated - 1.0,
+            "5-star tracks must land earlier than unrated ones: {five:.2} vs {unrated:.2}"
+        );
+        assert!(
+            unrated < one - 1.0,
+            "unrated must land earlier than 1-star: {unrated:.2} vs {one:.2}"
+        );
+        // Uniform shuffle would put all three at 5.5. If the top group is not
+        // clearly below that, the weighting is not doing anything.
+        assert!(five < 4.0, "5-star mean slot {five:.2} is barely better than uniform (5.5)");
+    }
+
+    /// Weighted, not filtered. A 1-star track in a queue full of 5-star ones must
+    /// still come up sometimes — and in particular must sometimes come up *first*,
+    /// or the mode has quietly become "play only favorites".
+    #[test]
+    fn a_disliked_track_is_rare_not_banned() {
+        let mut ratings = vec![5u8; 8];
+        ratings.push(1); // track 8
+        let mut rng = Rng::seeded(0xFEED_FACE);
+
+        let mut first = 0;
+        for _ in 0..4000 {
+            if favorites_order(&ratings, &mut rng)[0] == 8 {
+                first += 1;
+            }
+        }
+        assert!(first > 0, "a 1-star track must not be unreachable");
+        // 1 against eight 16s: 1/129 ≈ 0.8%, so ~31 of 4000. Anything near
+        // uniform (1/9 ≈ 444) means the weights are not being applied.
+        assert!(
+            first < 150,
+            "a 1-star track came first {first} times in 4000 — the weighting is too weak"
+        );
+    }
+
+    /// Plain shuffle must stay plain: with the mode off ratings change nothing,
+    /// which is what makes Favorites a *separate* mode rather than a tilt applied
+    /// to every shuffle.
+    #[test]
+    fn plain_shuffle_ignores_ratings_entirely() {
+        let mut rng = Rng::seeded(7);
+        let mut order: Vec<usize> = (0..12).collect();
+        let mut total_slot = vec![0usize; 12];
+        const PASSES: usize = 4000;
+        for _ in 0..PASSES {
+            order = (0..12).collect();
+            shuffle_in_place(&mut order, &mut rng);
+            for (slot, &track) in order.iter().enumerate() {
+                total_slot[track] += slot;
+            }
+        }
+        for track in 0..12 {
+            let mean = total_slot[track] as f64 / PASSES as f64;
+            assert!(
+                (mean - 5.5).abs() < 0.6,
+                "plain shuffle is not uniform: track {track} mean slot {mean:.2}"
+            );
+        }
+    }
+
+    #[test]
+    fn shuffle_mode_cycles_through_all_three_and_back() {
+        let mut m = Shuffle::Off;
+        m = m.cycle();
+        assert_eq!(m, Shuffle::On);
+        m = m.cycle();
+        assert_eq!(m, Shuffle::Favorites);
+        m = m.cycle();
+        assert_eq!(m, Shuffle::Off);
+    }
+
+    /// The string form is what lands in state.json, so an unknown value — a
+    /// hand-edited config, or one written by a future build — must read as Off
+    /// rather than panic.
+    #[test]
+    fn shuffle_mode_survives_a_round_trip_through_text() {
+        for mode in [Shuffle::Off, Shuffle::On, Shuffle::Favorites] {
+            assert_eq!(Shuffle::from_str(mode.as_str()), mode);
+        }
+        assert_eq!(Shuffle::from_str("weighted-by-mood"), Shuffle::Off);
+        assert_eq!(Shuffle::from_str(""), Shuffle::Off);
+    }
+
+    /// Unrated must not be treated as the worst possible rating. It sits level
+    /// with 2 stars: not yet judged, not disliked.
+    #[test]
+    fn unrated_outranks_one_star() {
+        assert!(weight_for(0) > weight_for(1));
+        assert_eq!(weight_for(0), weight_for(2));
+        assert!(weight_for(5) > weight_for(4));
+        // Anything out of range lands on the neutral weight rather than skewing.
+        assert_eq!(weight_for(200), weight_for(0));
+    }
+
+    /// Degenerate inputs the GUI can genuinely produce: an empty queue, and a
+    /// single track.
+    #[test]
+    fn empty_and_single_queues_do_not_panic() {
+        let mut rng = Rng::seeded(1);
+        let mut empty: Vec<usize> = Vec::new();
+        weighted_shuffle_in_place(&mut empty, &[], &mut rng);
+        assert!(empty.is_empty());
+
+        let mut one = vec![0usize];
+        weighted_shuffle_in_place(&mut one, &[16.0], &mut rng);
+        assert_eq!(one, vec![0]);
+    }
 }

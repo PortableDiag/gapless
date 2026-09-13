@@ -51,7 +51,7 @@ fn main() -> Result<()> {
     player.set_tracks(
         tracks
             .iter()
-            .map(|p| QueuedTrack { path: p.clone(), duration_nanos: 0 })
+            .map(|p| QueuedTrack { path: p.clone(), duration_nanos: 0, rating: 0 })
             .collect(),
     );
     player.set_trim_silence(std::env::var("GAPLESS_TRIM").is_ok());

@@ -6,7 +6,7 @@
 //! cross-thread command channel needed.
 
 use crate::library::Track;
-use crate::player::{Player, Repeat};
+use crate::player::{Player, Repeat, Shuffle};
 use mpris_server::{LoopStatus, Metadata, PlaybackStatus, Time, TrackId};
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -111,9 +111,21 @@ pub async fn start(player: Arc<Player>) -> Option<Mpris> {
         }
     });
 
+    // MPRIS `Shuffle` is a bool and has no way to express "favorites". Turning it
+    // on therefore keeps whatever on-mode is already set and only falls back to
+    // plain shuffle from a standing start — otherwise a lock-screen widget
+    // echoing back the `true` we just published would quietly demote the user's
+    // favorites shuffle to an ordinary one.
     mpris.connect_set_shuffle({
         let player = player.clone();
-        move |_, shuffle| player.set_shuffle(shuffle)
+        move |_, on| {
+            let mode = match (on, player.shuffle()) {
+                (false, _) => Shuffle::Off,
+                (true, current) if current.is_on() => current,
+                (true, _) => Shuffle::On,
+            };
+            player.set_shuffle(mode);
+        }
     });
 
     mpris.connect_set_volume({
@@ -193,7 +205,7 @@ pub fn publish_status(mpris: &Mpris, playing: bool) {
     });
 }
 
-pub fn publish_modes(mpris: &Mpris, repeat: Repeat, shuffle: bool) {
+pub fn publish_modes(mpris: &Mpris, repeat: Repeat, shuffle: Shuffle) {
     let status = match repeat {
         Repeat::Off => LoopStatus::None,
         Repeat::All => LoopStatus::Playlist,
@@ -202,6 +214,6 @@ pub fn publish_modes(mpris: &Mpris, repeat: Repeat, shuffle: bool) {
     let mpris = mpris.clone();
     glib::spawn_future_local(async move {
         let _ = mpris.set_loop_status(status).await;
-        let _ = mpris.set_shuffle(shuffle).await;
+        let _ = mpris.set_shuffle(shuffle.is_on()).await;
     });
 }

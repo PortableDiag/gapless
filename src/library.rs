@@ -23,6 +23,10 @@ pub struct Track {
     /// "FLAC · 44.1 kHz · 16-bit · 1006 kbps" — assembled at scan time from the
     /// decoder's own view of the file, not from the tags, which lie.
     pub format: String,
+    /// 1–5, or 0 for unrated. Never read from the file: it comes from the
+    /// ratings sidecar and is filled in after the scan — see `src/ratings.rs`
+    /// for why this is not a `POPM` frame.
+    pub rating: u8,
 }
 
 /// Embedded cover art. Read lazily on track change rather than at scan time —
@@ -95,6 +99,7 @@ pub fn read_track(path: &Path) -> Track {
             track_no: 0,
             duration_nanos: 0,
             format: ext,
+            rating: 0,
         };
     };
 
@@ -151,5 +156,6 @@ pub fn read_track(path: &Path) -> Track {
         track_no,
         duration_nanos,
         format: parts.join(" · "),
+        rating: 0,
     }
 }

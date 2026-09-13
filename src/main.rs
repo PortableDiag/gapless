@@ -2,7 +2,8 @@ use adw::prelude::*;
 use gapless::autostart;
 use gapless::library::{self, Track};
 use gapless::playlist;
-use gapless::player::{Player, PlayerEvent, QueuedTrack, Repeat};
+use gapless::player::{Player, PlayerEvent, QueuedTrack, Repeat, Shuffle};
+use gapless::ratings::{self, Ratings};
 use gapless::settings::Settings;
 use gapless::mpris;
 use gtk::glib;
@@ -49,6 +50,19 @@ const SEEK_DEBOUNCE: Duration = Duration::from_millis(150);
 /// the volume slider emits a value per frame.
 const SAVE_DEBOUNCE: Duration = Duration::from_millis(600);
 
+/// Favorites shuffle needs its own colour on the shuffle button. It cannot use
+/// the star glyph — the rating strip two inches to the left is made of stars,
+/// and a star on the transport row would read as "favorite this track" — and it
+/// cannot reuse `suggested-action`, which already means plain shuffle. The
+/// libadwaita named colours adapt to light and dark themes, so this stays a
+/// theme colour rather than a hard-coded gold.
+const FAVORITES_CSS: &str = "
+button.favorites-shuffle {
+    background-color: @warning_bg_color;
+    color: @warning_fg_color;
+}
+";
+
 /// How often the playing position is checkpointed to disk. Frequent enough that
 /// a crash costs you a few seconds, rare enough that it isn't a write per tick.
 const POSITION_SAVE_EVERY: Duration = Duration::from_secs(5);
@@ -65,6 +79,21 @@ struct Ui {
     seek: gtk::Scale,
     time_label: gtk::Label,
     list: gtk::ListBox,
+    /// The five star buttons under the track title. They rate `focus`.
+    stars: Vec<gtk::Button>,
+    /// One star label per list row, index-parallel to `tracks`. Kept so a rating
+    /// change repaints the row without rebuilding the list.
+    row_stars: RefCell<Vec<gtk::Label>>,
+    ratings: RefCell<Ratings>,
+    /// The track the now-playing panel is describing — playing, paused or merely
+    /// cued from the last session. This, not the list selection, is what the
+    /// star strip and the number keys rate: the strip sits inside the panel, so
+    /// rating anything else would be rating a track the panel is not showing.
+    focus: Cell<Option<usize>>,
+    /// The row a right-click opened the rating menu on. Separate from `focus`
+    /// because the whole point of the menu is rating a track that is *not*
+    /// the one playing.
+    menu_target: Cell<Option<usize>>,
     tracks: RefCell<Vec<Track>>,
     /// When the user last moved the seek slider. See SEEK_SETTLE.
     last_seek: Cell<Option<Instant>>,
@@ -126,6 +155,16 @@ fn build_window(app: &adw::Application) {
         settings.set_gtk_primary_button_warps_slider(true);
     }
     gtk::Window::set_default_icon_name(APP_ID);
+
+    let css = gtk::CssProvider::new();
+    css.load_from_string(FAVORITES_CSS);
+    if let Some(display) = gtk::gdk::Display::default() {
+        gtk::style_context_add_provider_for_display(
+            &display,
+            &css,
+            gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+        );
+    }
 
     let player = match Player::new() {
         Ok(p) => p,
@@ -203,6 +242,22 @@ fn build_window(app: &adw::Application) {
     volume.set_width_request(110);
     volume.set_tooltip_text(Some("Volume"));
 
+    // Five flat star buttons. Clicking the star you are already on clears the
+    // rating — the same gesture that set it takes it away, so there is no need
+    // for a separate "unrate" affordance in the strip.
+    let stars: Vec<gtk::Button> = (1..=ratings::MAX)
+        .map(|n| {
+            gtk::Button::builder()
+                .icon_name("non-starred-symbolic")
+                .css_classes(["flat", "circular"])
+                .tooltip_text(match n {
+                    1 => "Rate 1 star".to_string(),
+                    n => format!("Rate {n} stars"),
+                })
+                .build()
+        })
+        .collect();
+
     let ui = Rc::new(Ui {
         cover,
         now_playing,
@@ -215,6 +270,11 @@ fn build_window(app: &adw::Application) {
         seek,
         time_label,
         list,
+        stars,
+        row_stars: RefCell::new(Vec::new()),
+        ratings: RefCell::new(Ratings::load()),
+        focus: Cell::new(None),
+        menu_target: Cell::new(None),
         tracks: RefCell::new(Vec::new()),
         last_seek: Cell::new(None),
         seek_target: Cell::new(None),
@@ -226,10 +286,19 @@ fn build_window(app: &adw::Application) {
     });
 
     // ---- layout -------------------------------------------------------
+    // Deliberately in the metadata column, not the transport row: the stars rate
+    // the track named directly above them, and putting them beside the shuffle
+    // and repeat buttons would make them look like another playback mode.
+    let star_row = gtk::Box::builder().halign(gtk::Align::Start).build();
+    for button in &ui.stars {
+        star_row.append(button);
+    }
+
     let text_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
     text_box.append(&ui.now_playing);
     text_box.append(&ui.now_artist);
     text_box.append(&ui.now_detail);
+    text_box.append(&star_row);
     text_box.set_hexpand(true);
     text_box.set_valign(gtk::Align::Center);
 
@@ -302,7 +371,7 @@ fn build_window(app: &adw::Application) {
         "one" => Repeat::One,
         _ => Repeat::Off,
     });
-    player.set_shuffle(saved.shuffle);
+    player.set_shuffle(Shuffle::from_str(saved.shuffle_mode_str()));
     player.set_trim_silence(saved.trim_silence);
     player.set_crossfade((saved.crossfade_secs.clamp(0.0, 10.0) * 1e9) as u64);
     player.set_inner_limit((saved.inner_silence_secs.clamp(0.0, 10.0) * 1e9) as u64);
@@ -314,6 +383,7 @@ fn build_window(app: &adw::Application) {
         restore_last_track(&ui, &saved);
     }
 
+    install_rating_actions(app, &window, &ui, &player);
     wire_up(&window, &ui, &player, &open_button, &playlist_button, &prev_button, &next_button, &volume);
     listen_for_events(&ui, &player);
     persist_on_close(&window, &ui, &player);
@@ -603,7 +673,7 @@ fn wire_up(
 
     ui.shuffle_button.connect_clicked({
         let player = player.clone();
-        move |_| player.set_shuffle(!player.shuffle())
+        move |_| player.set_shuffle(player.shuffle().cycle())
     });
 
     open_button.connect_clicked({
@@ -698,6 +768,132 @@ fn wire_up(
             let _ = player.next();
         }
     });
+
+    for (i, button) in ui.stars.iter().enumerate() {
+        let want = i as u8 + 1;
+        button.connect_clicked({
+            let ui = ui.clone();
+            let player = player.clone();
+            move |_| {
+                let Some(track) = ui.focus.get() else { return };
+                let now = ui.tracks.borrow().get(track).map(|t| t.rating).unwrap_or(0);
+                // Clicking the star you are already on clears it.
+                let stars = if now == want { 0 } else { want };
+                apply_rating(&ui, &player, track, stars);
+            }
+        });
+    }
+
+    install_row_menu(ui, player);
+}
+
+/// Right-click (or long-press, or the Menu key) on any row rates that row.
+///
+/// The star strip can only rate the track the now-playing panel is showing, and
+/// a click on a row in this player *starts* it — so without this, rating a track
+/// means playing it first. One gesture and one shared popover, rather than five
+/// star buttons per row: the list is not virtualised, and a library of a few
+/// thousand tracks already builds a few thousand row widgets.
+fn install_row_menu(ui: &Rc<Ui>, player: &Arc<Player>) {
+    let menu = gtk::gio::Menu::new();
+    for n in (1..=ratings::MAX).rev() {
+        menu.append(Some(&ratings::stars_text(n)), Some(&format!("win.rate-row({n})")));
+    }
+    menu.append(Some("Clear rating"), Some("win.rate-row(0)"));
+
+    let popover = gtk::PopoverMenu::from_model(Some(&menu));
+    popover.set_parent(&ui.list);
+    popover.set_has_arrow(false);
+    popover.set_halign(gtk::Align::Start);
+
+    let gesture = gtk::GestureClick::builder()
+        .button(gtk::gdk::BUTTON_SECONDARY)
+        .build();
+    gesture.connect_pressed({
+        let ui = ui.clone();
+        let popover = popover.clone();
+        let _player = player.clone();
+        move |gesture, _, x, y| {
+            let Some(row) = ui.list.row_at_y(y as i32) else { return };
+            ui.menu_target.set(Some(row.index() as usize));
+            gesture.set_state(gtk::EventSequenceState::Claimed);
+            popover.set_pointing_to(Some(&gtk::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+            popover.popup();
+        }
+    });
+    ui.list.add_controller(gesture);
+}
+
+/// `win.rate` rates whatever the now-playing panel is showing and carries the
+/// number-key accelerators; `win.rate-row` rates the row the context menu was
+/// opened on. Two actions rather than one with a mutable target, so a stale
+/// target can never make a keypress rate the wrong song.
+fn install_rating_actions(
+    app: &adw::Application,
+    window: &adw::ApplicationWindow,
+    ui: &Rc<Ui>,
+    player: &Arc<Player>,
+) {
+    let rate = gtk::gio::SimpleAction::new("rate", Some(glib::VariantTy::INT32));
+    rate.connect_activate({
+        let ui = ui.clone();
+        let player = player.clone();
+        move |_, param| {
+            let Some(stars) = param.and_then(|p| p.get::<i32>()) else { return };
+            let Some(track) = ui.focus.get() else { return };
+            apply_rating(&ui, &player, track, stars.clamp(0, ratings::MAX as i32) as u8);
+        }
+    });
+    window.add_action(&rate);
+
+    let rate_row = gtk::gio::SimpleAction::new("rate-row", Some(glib::VariantTy::INT32));
+    rate_row.connect_activate({
+        let ui = ui.clone();
+        let player = player.clone();
+        move |_, param| {
+            let Some(stars) = param.and_then(|p| p.get::<i32>()) else { return };
+            let Some(track) = ui.menu_target.take() else { return };
+            apply_rating(&ui, &player, track, stars.clamp(0, ratings::MAX as i32) as u8);
+        }
+    });
+    window.add_action(&rate_row);
+
+    // 1–5 rate, 0 clears. Nothing else in this window takes typed input, so the
+    // bare digits are free.
+    for n in 0..=ratings::MAX as i32 {
+        app.set_accels_for_action(&format!("win.rate({n})"), &[&n.to_string()]);
+    }
+}
+
+/// The one place a rating changes. Writes the sidecar, updates the queue so the
+/// next favorites shuffle sees it, and repaints both places it is displayed.
+fn apply_rating(ui: &Rc<Ui>, player: &Arc<Player>, track: usize, stars: u8) {
+    let path = {
+        let tracks = ui.tracks.borrow();
+        let Some(t) = tracks.get(track) else { return };
+        t.path.clone()
+    };
+
+    {
+        let mut r = ui.ratings.borrow_mut();
+        r.set(&path, stars);
+        // Written immediately rather than debounced like `state.json`: this is
+        // the one thing on disk the user typed in by hand, and it changes once
+        // per click, not once per frame.
+        r.save();
+    }
+
+    if let Some(t) = ui.tracks.borrow_mut().get_mut(track) {
+        t.rating = stars;
+    }
+    player.set_rating(track, stars);
+
+    if let Some(label) = ui.row_stars.borrow().get(track) {
+        label.set_label(&ratings::stars_text(stars));
+    }
+    if ui.focus.get() == Some(track) {
+        set_stars_look(ui, Some(stars));
+    }
 }
 
 /// A folder and a playlist load through the same path, with one crucial
@@ -734,9 +930,20 @@ fn load_source(ui: &Rc<Ui>, player: &Arc<Player>, path: PathBuf) {
         }
     };
 
+    // Ratings are keyed by path and live outside the scan, so they have to be
+    // re-attached every time a source is loaded.
+    let mut tracks = tracks;
+    {
+        let r = ui.ratings.borrow();
+        for track in tracks.iter_mut() {
+            track.rating = r.get(&track.path);
+        }
+    }
+
     while let Some(row) = ui.list.first_child() {
         ui.list.remove(&row);
     }
+    ui.row_stars.borrow_mut().clear();
 
     for track in &tracks {
         let title = gtk::Label::builder()
@@ -758,6 +965,15 @@ fn load_source(ui: &Rc<Ui>, player: &Arc<Player>, path: PathBuf) {
         text.append(&title);
         text.append(&sub);
 
+        // A label, not five buttons. The list is not virtualised, so anything
+        // per-row is paid for once per track in the library; the stars are
+        // *set* from the strip, the number keys or the row's own context menu.
+        let stars = gtk::Label::builder()
+            .label(ratings::stars_text(track.rating))
+            .css_classes(["dim-label", "caption"])
+            .build();
+        ui.row_stars.borrow_mut().push(stars.clone());
+
         let dur = gtk::Label::builder()
             .label(clock(track.duration_nanos))
             .css_classes(["dim-label", "caption", "numeric"])
@@ -771,6 +987,7 @@ fn load_source(ui: &Rc<Ui>, player: &Arc<Player>, path: PathBuf) {
             .margin_end(12)
             .build();
         row_box.append(&text);
+        row_box.append(&stars);
         row_box.append(&dur);
 
         ui.list.append(&gtk::ListBoxRow::builder().child(&row_box).build());
@@ -782,10 +999,13 @@ fn load_source(ui: &Rc<Ui>, player: &Arc<Player>, path: PathBuf) {
             .map(|t| QueuedTrack {
                 path: t.path.clone(),
                 duration_nanos: t.duration_nanos,
+                rating: t.rating,
             })
             .collect(),
     );
     *ui.tracks.borrow_mut() = tracks;
+    ui.focus.set(None);
+    set_stars_look(ui, None);
     ui.now_artist.set_label(&format!("{subtitle} — press play"));
 
     // Remember it even if the user never plays anything.
@@ -823,6 +1043,8 @@ fn listen_for_events(ui: &Rc<Ui>, player: &Arc<Player>) {
                     ui.now_playing.set_label(&track.title);
                     ui.now_artist.set_label(&format!("{} — {}", track.artist, track.album));
                     ui.now_detail.set_label(&detail_line(&track));
+                    ui.focus.set(Some(i));
+                    set_stars_look(&ui, Some(track.rating));
 
                     let art = show_cover(&ui, &track);
 
@@ -879,6 +1101,8 @@ fn listen_for_events(ui: &Rc<Ui>, player: &Arc<Player>) {
                 }
                 PlayerEvent::QueueFinished => {
                     set_play_icon(&ui, false);
+                    ui.focus.set(None);
+                    set_stars_look(&ui, None);
                     ui.now_playing.set_label("Nothing playing");
                     ui.now_artist.set_label("End of queue");
                     ui.now_detail.set_label("");
@@ -940,7 +1164,7 @@ fn current_settings(ui: &Rc<Ui>, player: &Arc<Player>) -> Settings {
         Repeat::One => "one",
     }
     .into();
-    s.shuffle = player.shuffle();
+    s.set_shuffle_mode(player.shuffle().as_str());
     s.trim_silence = player.trim_silence();
     s.crossfade_secs = player.crossfade() as f64 / 1e9;
     s.inner_silence_secs = player.inner_limit() as f64 / 1e9;
@@ -1004,6 +1228,9 @@ fn restore_last_track(ui: &Rc<Ui>, saved: &Settings) {
     ui.now_playing.set_label(&track.title);
     ui.now_artist.set_label(&format!("{} — {}", track.artist, track.album));
     ui.now_detail.set_label(&detail_line(&track));
+    // A cued track is showing in the panel, so it is rateable before it plays.
+    ui.focus.set(Some(i));
+    set_stars_look(ui, Some(track.rating));
     show_cover(ui, &track);
     if let Some(row) = ui.list.row_at_index(i as i32) {
         ui.list.select_row(Some(&row));
@@ -1066,10 +1293,38 @@ fn set_repeat_look(ui: &Rc<Ui>, mode: Repeat) {
     set_active_look(&ui.repeat_button, mode != Repeat::Off);
 }
 
-fn set_shuffle_look(ui: &Rc<Ui>, on: bool) {
-    ui.shuffle_button
-        .set_tooltip_text(Some(if on { "Shuffle: on" } else { "Shuffle: off" }));
-    set_active_look(&ui.shuffle_button, on);
+/// Three states on one button, and they have to be told apart at a glance. The
+/// icon stays the same in all three — there is no "shuffle favorites" icon in the
+/// theme, and borrowing a star would collide with the rating strip — so the
+/// colour carries it: quiet when off, the standard accent for plain shuffle, the
+/// warning colour for favorites.
+fn set_shuffle_look(ui: &Rc<Ui>, mode: Shuffle) {
+    ui.shuffle_button.set_tooltip_text(Some(match mode {
+        Shuffle::Off => "Shuffle: off",
+        Shuffle::On => "Shuffle: on",
+        Shuffle::Favorites => "Shuffle: favorites first — higher-rated tracks come up sooner",
+    }));
+    set_active_look(&ui.shuffle_button, mode == Shuffle::On);
+    if mode == Shuffle::Favorites {
+        ui.shuffle_button.remove_css_class("flat");
+        ui.shuffle_button.add_css_class("favorites-shuffle");
+    } else {
+        ui.shuffle_button.remove_css_class("favorites-shuffle");
+    }
+}
+
+/// `None` means nothing is cued, so there is nothing to rate: the strip goes
+/// insensitive rather than showing five empty stars that silently do nothing.
+fn set_stars_look(ui: &Rc<Ui>, stars: Option<u8>) {
+    let rated = stars.unwrap_or(0);
+    for (i, button) in ui.stars.iter().enumerate() {
+        button.set_sensitive(stars.is_some());
+        button.set_icon_name(if (i as u8) < rated {
+            "starred-symbolic"
+        } else {
+            "non-starred-symbolic"
+        });
+    }
 }
 
 /// Off is a flat/quiet button; active modes are highlighted, so the state is

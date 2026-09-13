@@ -5,6 +5,7 @@ pub mod autostart;
 pub mod library;
 pub mod mpris;
 pub mod player;
+pub mod ratings;
 pub mod playlist;
 pub mod settings;
 pub mod silence;

@@ -161,6 +161,61 @@ offset)` and the first press of play consumes it via `play_index_at`, which is t
 same `start_at` path as a seek. A music player that begins blaring on login is a
 music player you uninstall.
 
+## Ratings, and the shuffle that uses them
+
+Ratings are 1–5 stars, held in **`~/.config/gapless/ratings.json`** and keyed by
+absolute path. Two deliberate choices:
+
+**Not written into the files.** `POPM` (ID3) and `RATING` (Vorbis) exist, and
+other players use them, but rating a song would then mean rewriting the user's
+audio file — and `POPM` has no agreed 1–5-to-0–255 mapping anyway, so a number
+read back only means something if you already know which player wrote it.
+
+**Not in `state.json`.** That file is rewritten every few seconds while playing
+and again from the SIGTERM handler. Ratings are the only thing on disk the user
+typed in by hand, so they get their own file, written through a temporary file
+and renamed, and written immediately rather than debounced — a rating changes
+once per click, not once per frame.
+
+`Shuffle` therefore has three states, not two: `Off`, `On`, `Favorites`.
+
+Favorites shuffle is **an ordering, not a filter** — every track still plays
+exactly once per pass. Each track gets a weight from its rating (1★ = 1, 2★ = 2,
+3★ = 4, 4★ = 8, 5★ = 16, unrated = 2) and the order is drawn by
+**Efraimidis–Spirakis** weighted sampling without replacement: give item *i* the
+key `u^(1/wᵢ)` for `u` uniform on (0,1), then sort by key descending. That is
+exactly equivalent to repeatedly drawing from what remains with probability
+proportional to weight, but in one O(n log n) pass.
+
+Three things about it are easy to get wrong and are therefore pinned by tests:
+
+  * **The keys are computed in log space** — `ln(u)/wᵢ` — because `u^(1/16)` over
+    a few thousand tracks crowds a lot of keys into the same few floats just below
+    1.0 and the sort stops telling them apart.
+  * **The sort is descending.** Ascending is a completely silent inversion: the
+    queue still shuffles, it just prefers the tracks you rated *worst*. This was a
+    real bug during development, caught only because the test measures the
+    direction rather than checking the result is a permutation.
+  * **Unrated sits at 2, level with 2★, not at the bottom.** "I have not judged
+    this" is not the same statement as "I do not like this".
+
+The ramp doubles per star on purpose. With linear weights a real library — which
+is overwhelmingly unrated — buries its handful of 5★ tracks under sheer volume.
+Measured over 4,000 passes of a 12-track queue (uniform would be 5.50):
+
+```
+5-star  mean slot 1.51      unrated  mean slot 5.96      1-star  mean slot 7.65
+```
+
+`cargo test -- --nocapture` prints that line, so a weighting that is technically
+in the right direction but too weak to hear stays visible.
+
+MPRIS is the awkward edge: its `Shuffle` property is a **bool**, so both on-states
+publish as `true`. A client echoing that back — lock-screen widgets do — would
+otherwise demote favorites shuffle to a plain one, silently. So `true` keeps
+whatever on-mode is already set, and only turns on plain shuffle from `Off`.
+`scripts/verify-mpris-modes.sh` checks all three directions.
+
 ## Start at login
 
 An XDG autostart entry at `~/.config/autostart/com.procomputation.Gapless.desktop`,

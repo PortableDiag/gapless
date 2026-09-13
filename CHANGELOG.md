@@ -5,7 +5,83 @@ All notable changes to Gapless. Newest first.
 The project is pre-1.0; entries are grouped by release and carry the commit
 that made them.
 
-## Unreleased
+## v0.2.0 — 2026-09-13
+
+### Added
+
+- **Star ratings, 1–5.** Set them from the strip under the track title in the
+  now-playing panel, from the number keys (`1`–`5` rate, `0` clears), or from a
+  right-click on any row in the list — the last of which matters because
+  clicking a row in this player *starts* it, so without a context menu you could
+  only rate a track by playing it first.
+
+  Stored in **`~/.config/gapless/ratings.json`**, keyed by absolute path.
+  Deliberately **not** written into the audio files: rating a song would
+  otherwise mean rewriting it, and `POPM` has no agreed 1–5-to-0–255 mapping, so
+  a value read back only means something if you already know which player wrote
+  it. Deliberately not in `state.json` either — that file is rewritten every few
+  seconds while playing and again from the SIGTERM handler, and ratings are the
+  one thing on disk the user typed in by hand. Written through a temp file and
+  renamed, and written on the click rather than debounced.
+
+  The list shows ratings as a plain label, not five buttons per row: the list is
+  not virtualised, so anything per-row is paid for once per track in the library.
+
+- **Favorites shuffle** — a third shuffle state, cycled with the same button:
+  off → shuffle → favorites.
+
+  It is an **ordering, not a filter**: every track still plays exactly once per
+  pass, but the order is drawn with higher-rated tracks weighted towards the
+  front. Weights double per star (1★ = 1 … 5★ = 16), with unrated at 2 — level
+  with 2★, because "I have not judged this" is not "I do not like this". The
+  draw is Efraimidis–Spirakis weighted sampling without replacement, computed in
+  log space so the keys stay distinguishable over a large queue.
+
+  Measured rather than asserted. Over 4,000 passes of a 12-track queue, where a
+  uniform shuffle puts every track at a mean slot of 5.50:
+
+  ```
+  5-star  1.51      unrated  5.96      1-star  7.65
+  ```
+
+  `cargo test -- --nocapture` prints that line on every run, so a weighting that
+  points the right way but is too weak to hear does not pass quietly.
+
+  **One bug worth recording.** The first implementation sorted the keys
+  ascending instead of descending. Nothing looked wrong — the queue shuffled,
+  every track appeared once, no warning anywhere — but the player preferred the
+  tracks you rated *worst*. It was caught only because the test measures the
+  direction rather than checking that the result is a permutation. The two tests
+  that measure direction and strength are there for that reason and should not
+  be reduced to a permutation check.
+
+- The shuffle button now has three looks, since it has three states: quiet when
+  off, the standard accent for plain shuffle, and the theme's warning colour for
+  favorites. It does **not** swap in a star icon — the rating strip a few inches
+  to its left is made of stars, and a star on the transport row reads as
+  "favorite this track", not "shuffle by favorites".
+
+### Changed
+
+- `state.json` gains **`shuffle_mode`** (`"off"` | `"on"` | `"favorites"`). The
+  old `shuffle` bool is still written on every save, so an older build and
+  `verify-mpris-modes.sh` both still read it, and still read when `shuffle_mode`
+  is absent, so a config written before this release migrates rather than
+  silently turning shuffle off.
+
+- **MPRIS cannot silently downgrade favorites shuffle.** Its `Shuffle` property
+  is a bool, and both on-states publish as `true`; a client that echoes the
+  property back — lock-screen widgets do — would otherwise turn the user's
+  favorites shuffle into a plain one with no visible symptom beyond the music
+  quietly no longer preferring their favorites. `true` now keeps whatever
+  on-mode is already set and only means plain shuffle from a standing start.
+  `false` still turns shuffle off.
+
+- `scripts/verify-mpris-modes.sh` now runs **three** cases rather than one: the
+  original crash-persistence check (still seeded in the old config format, so it
+  also exercises the migration), plus the two directions of the MPRIS bool
+  above. The third case exists so the second cannot pass by ignoring the
+  property altogether.
 
 ### Documentation
 
@@ -22,9 +98,8 @@ that made them.
   look like failures and aren't: the `fusermount3` / xdg-desktop-portal warning
   wall that `dbus-run-session` emits, and the buffered-pipe trap.
 
-  Documentation only — **no version bump and no tag.** No application code
-  changed, and publishing an identical binary would push a pointless "update
-  available" to every install.
+  (This entry was written against v0.1.5 as a documentation-only change with no
+  version bump; it ships here instead.)
 
 ## v0.1.5 — 2026-08-03
 

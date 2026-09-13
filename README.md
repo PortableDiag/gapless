@@ -42,6 +42,14 @@ both, and can crossfade instead if you'd rather.
 - **Cap silence inside a track** — for long pauses and hidden tracks buried in
   dead air. A cap, not a switch: a four-bar rest is music.
 - **Crossfade, 0–10 s** — Winamp-style, equal-power.
+- **Star ratings, 1–5** — on the now-playing panel, on the number keys, or from
+  a right-click on any row. Kept in a sidecar file, **not** written into your
+  audio files.
+- **Shuffle that prefers your favorites** — a third shuffle state that still
+  plays every track once, but draws the order with the higher-rated tracks
+  weighted towards the front. Measured, not asserted: over 4,000 passes of a
+  12-track queue, 5-star tracks average slot 1.5 where a plain shuffle averages
+  5.5.
 - Repeat off/all/one, shuffle, ReplayGain, MPRIS2 (media keys + lock screen) —
   and a mode toggled from the lock screen or `playerctl` repaints the buttons and
   is saved, exactly as a click on them would be.
@@ -116,7 +124,15 @@ Two more checks, each written after a real bug got past the ones above:
 
 ```sh
 ./scripts/verify-resume.sh       # a track resumed part-way in must still hand off
-./scripts/verify-mpris-modes.sh  # a mode set over D-Bus must survive a SIGKILL
+./scripts/verify-mpris-modes.sh  # a mode set over D-Bus must survive a SIGKILL,
+                                 # and must not downgrade favorites shuffle
+```
+
+The weighted shuffle is measured by the unit tests, which print the distribution
+rather than only asserting its direction:
+
+```sh
+cargo test -- --nocapture
 ```
 
 Those two launch the real application, so they need a display — prefix them with
@@ -136,7 +152,9 @@ and needs nothing.
 ## Status
 
 Playback is solid. Not yet done: no database (the library is rescanned on each
-open), no search, no queue editing, no folder.jpg cover fallback.
+open, and ratings are a flat JSON sidecar rather than a table), no search, no
+queue editing, no folder.jpg cover fallback, and no import of ratings already
+sitting in your files' `POPM` frames.
 
 Note that **Next is a hard cut, deliberately** — it tears the mixer timeline down
 and starts the new track at once. Crossfade applies to the track that follows
