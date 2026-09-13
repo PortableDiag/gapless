@@ -12,6 +12,7 @@ src/
   mpris.rs     MPRIS2 — media keys, lock screen
   settings.rs  ~/.config/gapless/state.json
   ratings.rs   ~/.config/gapless/ratings.json — star ratings, 1–5
+  share.rs     the clipboard payloads and "save a copy" for the Share button
   api.rs       the local HTTP control API (docs/API.md)
 examples/      diagnostic tools (below)
 scripts/       setup, test-signal generation, verification (five suites)

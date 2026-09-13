@@ -188,6 +188,53 @@ sleep 1
 check "pause"       False "$(api "$BASE/api/status" | field playing)"
 
 echo
+echo "=== sharing ==="
+SHARE=$(api -X POST -d '{"index":0}' "$BASE/api/share")
+check "share returns the details" yes \
+      "$(printf '%s' "$SHARE" | python3 -c 'import json,sys;print("yes" if "Title" in json.load(sys.stdin).get("details","") else "no")')"
+check "share names the file" yes \
+      "$(printf '%s' "$SHARE" | python3 -c 'import json,sys;print("yes" if json.load(sys.stdin).get("file","").endswith((".mp3",".flac")) else "no")')"
+OUT=$(mktemp -d)
+COPIED=$(api -X POST -d "{\"index\":0,\"dest\":\"$OUT\"}" "$BASE/api/share")
+check "share wrote the audio file" 1 "$(find "$OUT" -maxdepth 1 \( -name '*.mp3' -o -name '*.flac' \) | wc -l)"
+check "share wrote the metadata beside it" 1 "$(find "$OUT" -maxdepth 1 -name '*.txt' | wc -l)"
+check "the copy is byte-identical" yes \
+      "$(SRC=$(printf '%s' "$SHARE" | python3 -c 'import json,sys;print(json.load(sys.stdin)["file"])');
+         DST=$(find "$OUT" -maxdepth 1 \( -name '*.mp3' -o -name '*.flac' \) | head -1);
+         cmp -s "$SRC" "$DST" && echo yes || echo no)"
+# Sharing twice must not overwrite the first copy.
+api -X POST -d "{\"index\":0,\"dest\":\"$OUT\"}" "$BASE/api/share" >/dev/null
+check "sharing twice keeps both copies" 2 "$(find "$OUT" -maxdepth 1 \( -name '*.mp3' -o -name '*.flac' \) | wc -l)"
+check "a bad destination is a 404" 404 \
+      "$(code -X POST -H "Authorization: Bearer $KEY" -d '{"index":0,"dest":"/no/such/dir"}' "$BASE/api/share")"
+check "an unknown mode is refused, not guessed" 400 \
+      "$(code -X POST -H "Authorization: Bearer $KEY" -d '{"index":0,"mode":"telepathy"}' "$BASE/api/share")"
+rm -rf "$OUT"
+
+# The API must share FULLY - including the clipboard, which is the half that is
+# easy to leave out because it is awkward to express over HTTP. The clipboard
+# belongs to the running application, so the API can set exactly what the button
+# sets, and this reads it back off the X server to prove it.
+if command -v xclip >/dev/null; then
+  api -X POST -d '{"index":0,"mode":"clipboard"}' "$BASE/api/share" >/dev/null
+  sleep 1
+  U=$(xclip -selection clipboard -t text/uri-list -o 2>/dev/null)
+  P=$(xclip -selection clipboard -t UTF8_STRING -o 2>/dev/null)
+  check "API clipboard share offers the file" yes \
+        "$(case "$U" in file://*) echo yes;; *) echo no;; esac)"
+  check "and the metadata from the same copy" yes \
+        "$(case "$P" in *Title*) echo yes;; *) echo no;; esac)"
+  api -X POST -d '{"index":1,"mode":"details"}' "$BASE/api/share" >/dev/null
+  sleep 1
+  D=$(xclip -selection clipboard -o 2>/dev/null)
+  check "API details share puts text on the clipboard" yes \
+        "$(case "$D" in *Title*File*) echo yes;; *) echo no;; esac)"
+else
+  echo "  [FAIL] xclip is not installed; the API clipboard share cannot be checked"
+  FAIL=$((FAIL+1))
+fi
+
+echo
 echo "=== playback settings ==="
 api -X POST -d '{"crossfade_secs":3.0,"trim_silence":false}' "$BASE/api/settings" >/dev/null
 check "crossfade set"   3.0   "$(api "$BASE/api/settings" | field crossfade_secs)"

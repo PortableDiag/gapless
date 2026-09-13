@@ -5,7 +5,63 @@ All notable changes to Gapless. Newest first.
 The project is pre-1.0; entries are grouped by release and carry the commit
 that made them.
 
-## Unreleased
+## v0.5.0 — 2026-09-13
+
+### Added
+
+- **Share a track** — the button under the song title, beside the star strip, and
+  the same three actions on a right-click of any row in the list.
+
+  | | |
+  |---|---|
+  | **Copy file** | puts the **audio file itself** on the clipboard, *and* the metadata as text, from the same copy |
+  | **Copy details** | just the metadata, as text |
+  | **Save a copy…** | the audio file into a folder you choose, with a readable `.txt` of the details beside it |
+
+  **One clipboard, several representations**, which is the part that makes the
+  button useful rather than decorative. Paste into Telegram, Discord or a file
+  manager and it takes `text/uri-list` — you get the actual audio file. Paste
+  into a text field and it takes `text/plain` — you get the metadata. Offering
+  only one of those makes the button work in half the places somebody would press
+  it. The third payload, `x-special/gnome-copied-files`, is what GTK and
+  Nautilus-derived file managers look for, and its `copy\n` prefix is what
+  distinguishes a copy from a cut — **without it a paste can move the user's
+  music out of their library.**
+
+  **Save a copy never overwrites.** A clashing name gets ` (2)`, ` (3)` and so
+  on, and the audio and its metadata take the **same** suffix so the pair cannot
+  be split up. A share that silently replaced a file in the destination would be
+  a share that eats somebody's work.
+
+  The metadata is deliberately plain text with aligned labels, not JSON: a person
+  is meant to read it. Empty fields are omitted rather than printed as blank
+  headings, so sharing an untagged file is not a column of empty labels. The
+  machine-readable form is what `GET /api/queue` already returns.
+
+- **`POST /api/share`** — and it shares **fully**, clipboard included. The
+  clipboard belongs to the running application, so an API caller gets the same
+  clipboard the button would have set rather than a lesser version of the
+  feature. `mode: clipboard` for the file and its details, `mode: details` for
+  the text, `dest` for a copy on disk, neither for a description of what you
+  would be sharing. An unknown `mode` is a **400**, not a guess.
+
+  This matters because "the API does everything the window does" is an invariant
+  of this project, not a nice-to-have — the first draft of the endpoint left the
+  clipboard out on the grounds that it was awkward to express over HTTP, which is
+  exactly the kind of reasoning that hollows an API out.
+
+### Verification
+
+- `scripts/verify-api.sh` 44 → **55**: the details, the file, a byte-identical
+  copy, that sharing twice keeps **both** copies, a bad destination, an unknown
+  mode, and — read back off the X clipboard — that both API clipboard modes put
+  what they claim where they claim.
+- `scripts/verify-input.sh` 9 → **13**: the Share actions in the real window,
+  with all four clipboard payloads read back, including that the file-manager
+  payload says `copy` and not `cut`.
+
+`cargo test` 40/40 · `verify.sh` 6/6 · `verify-resume.sh` 4/4 ·
+`verify-mpris-modes.sh` 4/4 · `verify-api.sh` 55/55 · `verify-input.sh` 13/13
 
 ### Documentation
 
@@ -32,6 +88,7 @@ that made them.
   Documentation only — **no version bump and no tag.** No application code
   changed, and publishing an identical binary would push a pointless "update
   available" to every install.
+
 
 ## v0.4.0 — 2026-09-13
 

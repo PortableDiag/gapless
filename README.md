@@ -50,6 +50,11 @@ both, and can crossfade instead if you'd rather.
   weighted towards the front. Measured, not asserted: over 4,000 passes of a
   12-track queue, 5-star tracks average slot 1.5 where a plain shuffle averages
   5.5.
+- **Share a track** — the button under the song title, or a right-click on any
+  row. Puts the **audio file itself** on the clipboard so it pastes into a chat
+  window or a file manager, and the metadata as text at the same time, from the
+  same copy — or saves a copy to a folder with a readable `.txt` of the details
+  beside it. Also `POST /api/share`.
 - **A local control API** — HTTP and JSON on 127.0.0.1, key-authenticated, off
   until you switch it on. It does everything the window does, so an agent or a
   script can drive the player. `GET /api/docs` serves the full reference from
@@ -131,7 +136,7 @@ Four more checks, each written after a real bug got past the ones above:
 ./scripts/verify-resume.sh                  # a track resumed part-way in must still hand off
 DISPLAY=:0 ./scripts/verify-mpris-modes.sh  # a mode set over D-Bus must survive a SIGKILL, must
                                             # not downgrade favorites shuffle, and Play must resume
-DISPLAY=:0 ./scripts/verify-api.sh          # 44 checks over a real socket against the real app
+DISPLAY=:0 ./scripts/verify-api.sh          # 51 checks over a real socket against the real app
 DISPLAY=:0 ./scripts/verify-input.sh        # the rating keys and the right-click menu, real input
 ```
 

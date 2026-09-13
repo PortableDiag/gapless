@@ -7,6 +7,7 @@ pub mod library;
 pub mod mpris;
 pub mod player;
 pub mod ratings;
+pub mod share;
 pub mod playlist;
 pub mod settings;
 pub mod silence;

@@ -5,6 +5,7 @@ use gapless::library::{self, Track};
 use gapless::playlist;
 use gapless::player::{Player, PlayerEvent, QueuedTrack, Repeat, Shuffle};
 use gapless::ratings::{self, Ratings};
+use gapless::share;
 use gapless::settings::Settings;
 use serde_json::{json, Value};
 use gapless::mpris;
@@ -101,6 +102,9 @@ struct Ui {
     list: gtk::ListBox,
     /// The five star buttons under the track title. They rate `focus`.
     stars: Vec<gtk::Button>,
+    /// Shares `focus` — the track the panel is describing. Insensitive when
+    /// there is nothing cued, for the same reason the star strip is.
+    share_button: gtk::MenuButton,
     /// One star label per list row, index-parallel to `tracks`. Kept so a rating
     /// change repaints the row without rebuilding the list.
     row_stars: RefCell<Vec<gtk::Label>>,
@@ -323,6 +327,21 @@ fn build_window(app: &adw::Application) {
     // GTK main thread, in the same place a button click would be.
     let (api_tx, api_rx) = async_channel::unbounded::<ApiRequest>();
 
+    // A menu rather than a single action: "share" means the file in a chat
+    // window, the text in a message, or a copy on a USB stick depending on where
+    // it is going, and guessing wrong is worse than asking.
+    let share_menu = gtk::gio::Menu::new();
+    share_menu.append(Some("Copy file"), Some("win.share('copy')"));
+    share_menu.append(Some("Copy details"), Some("win.share('details')"));
+    share_menu.append(Some("Save a copy…"), Some("win.share('save')"));
+
+    let share_button = gtk::MenuButton::builder()
+        .icon_name("send-to-symbolic")
+        .tooltip_text("Share this track — the file, or its details")
+        .css_classes(["flat", "circular"])
+        .menu_model(&share_menu)
+        .build();
+
     let ui = Rc::new(Ui {
         cover,
         now_playing,
@@ -344,6 +363,7 @@ fn build_window(app: &adw::Application) {
         time_label,
         list,
         stars,
+        share_button,
         row_stars: RefCell::new(Vec::new()),
         ratings: RefCell::new(Ratings::load()),
         focus: Cell::new(None),
@@ -365,6 +385,10 @@ fn build_window(app: &adw::Application) {
     for button in &ui.stars {
         star_row.append(button);
     }
+    // Beside the stars, under the track it acts on — both are "things you do to
+    // this song", and neither belongs in the transport row.
+    star_row.append(&gtk::Separator::new(gtk::Orientation::Vertical));
+    star_row.append(&ui.share_button);
 
     let text_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
     text_box.append(&ui.now_playing);
@@ -1086,6 +1110,15 @@ fn install_row_menu(ui: &Rc<Ui>, player: &Arc<Player>) {
     }
     menu.append(Some("Clear rating"), Some("win.rate-row(0)"));
 
+    // The same three, for a row that is not the one playing. Without these you
+    // could only share a track by starting it first, which is the same reason
+    // the rating items are here.
+    let share_section = gtk::gio::Menu::new();
+    share_section.append(Some("Copy file"), Some("win.share-row('copy')"));
+    share_section.append(Some("Copy details"), Some("win.share-row('details')"));
+    share_section.append(Some("Save a copy…"), Some("win.share-row('save')"));
+    menu.append_section(None, &share_section);
+
     let popover = gtk::PopoverMenu::from_model(Some(&menu));
     popover.set_parent(&ui.list);
     popover.set_has_arrow(false);
@@ -1143,11 +1176,136 @@ fn install_rating_actions(
     });
     window.add_action(&rate_row);
 
+    // The same three share actions, for the panel and for a row. Two actions
+    // rather than one with a mutable target, for the same reason as `rate`: a
+    // stale target must never be able to share the wrong song.
+    let share = gtk::gio::SimpleAction::new("share", Some(glib::VariantTy::STRING));
+    share.connect_activate({
+        let ui = ui.clone();
+        let player = player.clone();
+        let window = window.clone();
+        move |_, param| {
+            let Some(what) = param.and_then(|p| p.str().map(|s| s.to_string())) else { return };
+            let Some(track) = focused_track(&ui, &player) else { return };
+            do_share(&ui, &window, track, &what);
+        }
+    });
+    window.add_action(&share);
+
+    let share_row = gtk::gio::SimpleAction::new("share-row", Some(glib::VariantTy::STRING));
+    share_row.connect_activate({
+        let ui = ui.clone();
+        let window = window.clone();
+        move |_, param| {
+            let Some(what) = param.and_then(|p| p.str().map(|s| s.to_string())) else { return };
+            let Some(track) = ui.menu_target.take() else { return };
+            do_share(&ui, &window, track, &what);
+        }
+    });
+    window.add_action(&share_row);
+
     // 1–5 rate, 0 clears. Nothing else in this window takes typed input, so the
     // bare digits are free.
     for n in 0..=ratings::MAX as i32 {
         app.set_accels_for_action(&format!("win.rate({n})"), &[&n.to_string()]);
     }
+}
+
+/// Share one track, by whichever route was asked for.
+///
+/// `copy` and `details` are the same clipboard call with a different set of
+/// payloads; `save` needs a folder, so it opens a chooser and finishes in the
+/// callback.
+fn do_share(ui: &Rc<Ui>, window: &adw::ApplicationWindow, index: usize, what: &str) {
+    let track = {
+        let tracks = ui.tracks.borrow();
+        let Some(t) = tracks.get(index) else { return };
+        t.clone()
+    };
+
+    let Some(display) = gtk::gdk::Display::default() else { return };
+    let clipboard = display.clipboard();
+
+    match what {
+        "copy" => match copy_track_to_clipboard(&track) {
+            Ok(()) => flash_now_playing(ui, &format!("Copied “{}” to the clipboard", track.title)),
+            Err(e) => flash_now_playing(ui, &format!("Could not copy it: {e}")),
+        },
+        "details" => {
+            clipboard.set_text(&share::details(&track));
+            flash_now_playing(ui, "Copied the track details");
+        }
+        "save" => {
+            let chooser = gtk::FileDialog::builder()
+                .title(format!("Save a copy of “{}”", track.title))
+                .build();
+            let ui = ui.clone();
+            chooser.select_folder(Some(window), gtk::gio::Cancellable::NONE, move |result| {
+                let Ok(folder) = result else { return };
+                let Some(dir) = folder.path() else { return };
+                match share::copy_to(&track, &dir) {
+                    Ok((audio, _meta)) => {
+                        let name = audio
+                            .file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_default();
+                        flash_now_playing(&ui, &format!("Saved {name} and its details"));
+                    }
+                    // Say which file and why. A share that fails silently looks
+                    // exactly like one that worked.
+                    Err(e) => flash_now_playing(&ui, &format!("Could not save it: {e}")),
+                }
+            });
+        }
+        _ => {}
+    }
+}
+
+/// Puts the audio file **and** its metadata on the system clipboard in one go,
+/// so a paste works in a chat window, a file manager and a text field alike —
+/// see `share::clipboard_payloads` for why all three payloads are needed.
+///
+/// Shared by the Share button and by `POST /api/share`: the clipboard belongs to
+/// the running application, so an API caller asking to "share" a track gets the
+/// same clipboard the button would have set, rather than a lesser version of the
+/// feature.
+fn copy_track_to_clipboard(track: &Track) -> Result<(), String> {
+    let display = gtk::gdk::Display::default().ok_or("no display")?;
+    let providers: Vec<gtk::gdk::ContentProvider> = share::clipboard_payloads(track)
+        .into_iter()
+        .map(|(mime, body)| {
+            gtk::gdk::ContentProvider::for_bytes(mime, &glib::Bytes::from_owned(body.into_bytes()))
+        })
+        .collect();
+    display
+        .clipboard()
+        .set_content(Some(&gtk::gdk::ContentProvider::new_union(&providers)))
+        .map_err(|e| e.to_string())
+}
+
+/// Say what just happened, in the line under the track title, and put the track
+/// back a few seconds later.
+///
+/// There is no toast overlay in this window and adding one for three messages
+/// would be more chrome than it is worth; the subtitle is already the line the
+/// eye is on when you press a button under the title.
+fn flash_now_playing(ui: &Rc<Ui>, message: &str) {
+    let restore = ui.now_artist.label().to_string();
+    let shown = message.to_string();
+    ui.now_artist.set_label(&shown);
+
+    let ui = ui.clone();
+    glib::timeout_add_local_once(Duration::from_secs(4), move || {
+        // Only put back what we replaced, and only if OUR message is still on
+        // screen. A track change in the meantime has already written the right
+        // thing here, and restoring over it would show the previous song's
+        // artist. Comparing the label against the message we set is the whole
+        // check — comparing it against itself is always true and silently
+        // reintroduces the bug.
+        if ui.now_artist.label() == shown {
+            ui.now_artist.set_label(&restore);
+        }
+    });
 }
 
 /// The one place a rating changes. Writes the sidecar, updates the queue so the
@@ -1650,6 +1808,8 @@ fn set_shuffle_look(ui: &Rc<Ui>, mode: Shuffle) {
 /// `None` means nothing is cued, so there is nothing to rate: the strip goes
 /// insensitive rather than showing five empty stars that silently do nothing.
 fn set_stars_look(ui: &Rc<Ui>, stars: Option<u8>) {
+    // Nothing cued means nothing to share either.
+    ui.share_button.set_sensitive(stars.is_some());
     let rated = stars.unwrap_or(0);
     for (i, button) in ui.stars.iter().enumerate() {
         button.set_sensitive(stars.is_some());
@@ -1735,6 +1895,7 @@ fn dispatch(ui: &Rc<Ui>, player: &Arc<Player>, req: &ApiRequest) -> ApiResponse 
                 "POST /api/open":      "{path} — a folder or a playlist file",
                 "GET  /api/settings":  "playback settings",
                 "POST /api/settings":  "{trim_silence?, crossfade_secs?, inner_silence_secs?}",
+                "POST /api/share":     "{index|path, mode?: clipboard|details, dest?} — everything the Share button does",
                 "POST /api/listen":    "{port} — move the API to another port, for a handover",
                 "GET  /api/autostart": "whether Gapless starts at login",
                 "POST /api/autostart": "{enabled}",
@@ -2001,6 +2162,95 @@ fn dispatch(ui: &Rc<Ui>, player: &Arc<Player>, req: &ApiRequest) -> ApiResponse 
             }))
         }
 
+        // Everything the window does, the API does — including Share. The
+        // clipboard is a window concept, so what an API caller wants is the two
+        // halves underneath it: the metadata, and a copy of the file.
+        ("/api/share", _, true) => {
+            let index = match (req.u64("index"), req.string("path")) {
+                (Some(i), _) => i as usize,
+                (None, Some(path)) => {
+                    let want = PathBuf::from(path);
+                    match ui.tracks.borrow().iter().position(|t| t.path == want) {
+                        Some(i) => i,
+                        None => return ApiResponse::error(404, "that path is not in the current queue"),
+                    }
+                }
+                (None, None) => match focused_track(ui, player) {
+                    Some(i) => i,
+                    None => return ApiResponse::error(409, "nothing is playing — send index or path"),
+                },
+            };
+            let track = {
+                let tracks = ui.tracks.borrow();
+                match tracks.get(index) {
+                    Some(t) => t.clone(),
+                    None => return ApiResponse::error(404, "no track at that index"),
+                }
+            };
+
+            // `mode` covers the two clipboard actions the Share button has, so
+            // the API can share a track *fully* rather than doing the half that
+            // happens to be easy to express over HTTP. The clipboard belongs to
+            // the running application, and this runs on its main thread.
+            match req.string("mode").as_deref() {
+                Some("clipboard") | Some("copy") => {
+                    return match copy_track_to_clipboard(&track) {
+                        Ok(()) => ApiResponse::ok(json!({
+                            "ok": true,
+                            "copied": "file+details",
+                            "types": ["text/uri-list", "x-special/gnome-copied-files", "text/plain;charset=utf-8"],
+                            "track": track_json(index, &track),
+                        })),
+                        Err(e) => ApiResponse::error(500, &format!("could not set the clipboard: {e}")),
+                    };
+                }
+                Some("details") => {
+                    let Some(display) = gtk::gdk::Display::default() else {
+                        return ApiResponse::error(500, "no display — the clipboard needs one");
+                    };
+                    let details = share::details(&track);
+                    display.clipboard().set_text(&details);
+                    return ApiResponse::ok(json!({
+                        "ok": true,
+                        "copied": "details",
+                        "details": details,
+                        "track": track_json(index, &track),
+                    }));
+                }
+                Some(other) => {
+                    return ApiResponse::error(
+                        400,
+                        &format!("unknown share mode {other:?} — use clipboard, details, or send dest"),
+                    );
+                }
+                None => {}
+            }
+
+            // No `mode` and no `dest`: answer with the details and the path, so a
+            // caller can decide what to do with them. With `dest`: write the pair.
+            let Some(dest) = req.string("dest") else {
+                return ApiResponse::ok(json!({
+                    "ok": true,
+                    "details": share::details(&track),
+                    "file": track.path,
+                    "track": track_json(index, &track),
+                }));
+            };
+
+            match share::copy_to(&track, &PathBuf::from(&dest)) {
+                Ok((audio, meta)) => ApiResponse::ok(json!({
+                    "ok": true,
+                    "audio": audio,
+                    "metadata": meta,
+                    "track": track_json(index, &track),
+                })),
+                Err(e) => ApiResponse::error(
+                    if e.kind() == std::io::ErrorKind::NotFound { 404 } else { 500 },
+                    &format!("could not share into {dest}: {e}"),
+                ),
+            }
+        }
+
         // Used by `scripts/handover.sh` after the outgoing player has exited.
         ("/api/listen", _, true) => {
             let Some(port) = req.u64("port") else {
@@ -2074,6 +2324,7 @@ fn known_route(path: &str) -> bool {
             | "/api/rating"
             | "/api/open"
             | "/api/settings"
+            | "/api/share"
             | "/api/listen"
             | "/api/autostart"
             | "/api/quit"

@@ -102,6 +102,7 @@ the key needs nothing else to get started.
 | `POST /api/open` | `{path}` — a folder or a playlist |
 | `GET /api/settings` | playback settings |
 | `POST /api/settings` | `{trim_silence?, crossfade_secs?, inner_silence_secs?}` |
+| `POST /api/share` | `{index\|path, mode?, dest?}` — everything the Share button does |
 | `POST /api/listen` | `{port}` — move the API to another port, for a handover |
 | `GET /api/autostart` | whether Gapless starts at login |
 | `POST /api/autostart` | `{enabled}` |
@@ -273,6 +274,60 @@ curl -s -X POST -H "Authorization: Bearer $KEY" \
 
 Out of range is a 400 and changes nothing. Send at least one field or you get a
 400 saying so, rather than a successful call that did nothing.
+
+---
+
+## Sharing a track
+
+**`POST /api/share` does everything the Share button does**, including the two
+clipboard actions. The clipboard belongs to the running application, so an API
+caller gets the same clipboard the button would have set — not a lesser version
+of the feature.
+
+| `mode` | what happens |
+|---|---|
+| `clipboard` (or `copy`) | the **audio file and its metadata** go on the system clipboard together, so a paste works in a chat window, a file manager *and* a text field |
+| `details` | just the metadata, as text |
+| *(omitted, with `dest`)* | a copy of the file and a readable `.txt` of the details, written into `dest` |
+| *(omitted, no `dest`)* | answers with the details and the path, and changes nothing |
+
+An unknown `mode` is a **400**, not a guess.
+
+```sh
+# Put the track on the clipboard, exactly as the button does.
+curl -s -X POST -H "Authorization: Bearer $KEY" \
+     -d '{"index":6,"mode":"clipboard"}' "$BASE/api/share"
+
+# Or just ask what you would be sharing.
+curl -s -X POST -H "Authorization: Bearer $KEY" \
+     -d '{"index":6}' "$BASE/api/share"
+```
+
+```json
+{
+  "ok": true,
+  "details": "Title    Get to the Choppa\nArtist   Austrian Death Machine\n…",
+  "file": "/home/me/Music/album/03 Get to the Choppa.mp3",
+  "track": { "...": "the same shape as /api/queue" }
+}
+```
+
+Add `dest` and it writes the pair into that directory — the audio file, and a
+readable `.txt` of the metadata beside it:
+
+```sh
+curl -s -X POST -H "Authorization: Bearer $KEY" \
+     -d '{"index":6,"dest":"/home/me/Shared"}' "$BASE/api/share"
+# -> {"ok":true,"audio":"…/03 Get to the Choppa.mp3","metadata":"…/03 Get to the Choppa.txt", …}
+```
+
+**It never overwrites.** A clashing name gets ` (2)`, ` (3)` and so on, and the
+audio and its metadata take the **same** suffix so the pair cannot be split up.
+A share that silently replaced a file in the destination would be a share that
+eats somebody's work.
+
+Omit both `index` and `path` to share whatever is playing. A `dest` that is not
+a directory is a **404**.
 
 ---
 

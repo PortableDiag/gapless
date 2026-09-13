@@ -144,6 +144,48 @@ except Exception:
     print(0)')
 check "the menu item chosen applied its rating" 4 "$MENU_STARS"
 
+echo
+echo "=== Share puts the file AND the text on the clipboard ==="
+if ! command -v xclip >/dev/null; then
+  echo "  [FAIL] xclip is not installed, so the clipboard cannot be checked"
+  FAIL=$((FAIL+1))
+else
+  # Driven through the window action, which is exactly what the menu item
+  # activates. The menu itself is a GtkPopoverMenu; its items are these actions.
+  gdbus call --session --dest com.procomputation.Gapless \
+    --object-path /com/procomputation/Gapless/window/1 \
+    --method org.gtk.Actions.Activate share "[<'details'>]" "{}" >/dev/null 2>&1
+  sleep 1
+  TEXT=$(xclip -selection clipboard -o 2>/dev/null)
+  case "$TEXT" in
+    *Title*File*) echo "  [PASS] 'Copy details' put the metadata on the clipboard"; PASS=$((PASS+1)) ;;
+    *) echo "  [FAIL] 'Copy details' clipboard was: ${TEXT:0:60}"; FAIL=$((FAIL+1)) ;;
+  esac
+
+  gdbus call --session --dest com.procomputation.Gapless \
+    --object-path /com/procomputation/Gapless/window/1 \
+    --method org.gtk.Actions.Activate share "[<'copy'>]" "{}" >/dev/null 2>&1
+  sleep 1
+  # The whole point of the union provider: a file manager or a chat window asks
+  # for uri-list, a text field asks for plain text, from the SAME copy.
+  URIS=$(xclip -selection clipboard -t text/uri-list -o 2>/dev/null)
+  PLAIN=$(xclip -selection clipboard -t UTF8_STRING -o 2>/dev/null)
+  case "$URIS" in
+    file://*sweep.mp3*) echo "  [PASS] 'Copy file' offers the audio file as text/uri-list"; PASS=$((PASS+1)) ;;
+    *) echo "  [FAIL] uri-list was: ${URIS:0:70}"; FAIL=$((FAIL+1)) ;;
+  esac
+  case "$PLAIN" in
+    *Title*) echo "  [PASS] the same copy also offers the metadata as text"; PASS=$((PASS+1)) ;;
+    *) echo "  [FAIL] text/plain was: ${PLAIN:0:70}"; FAIL=$((FAIL+1)) ;;
+  esac
+  # A paste must COPY the user's music, never move it.
+  GNOME=$(xclip -selection clipboard -t x-special/gnome-copied-files -o 2>/dev/null)
+  case "$GNOME" in
+    copy$'\n'file://*) echo "  [PASS] the file-manager payload says copy, not cut"; PASS=$((PASS+1)) ;;
+    *) echo "  [FAIL] gnome-copied-files was: ${GNOME:0:40}"; FAIL=$((FAIL+1)) ;;
+  esac
+fi
+
 kill -9 "$APP" 2>/dev/null
 wait "$APP" 2>/dev/null
 
