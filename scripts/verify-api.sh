@@ -33,6 +33,18 @@ PORT=18421
 PASS=0
 FAIL=0
 
+# This check launches the real application, so a window appears on the operator's
+# screen. That is an interruption even though it takes no input, so it waits for
+# the machine to be free first. `xprintidle` was installed for this.
+#   GAPLESS_WINDOWS_OK=1  run immediately anyway
+if [ "${GAPLESS_WINDOWS_OK:-}" != "1" ]; then
+  if ! ./scripts/wait-for-idle.sh "${GAPLESS_IDLE_SECS:-10}" "${GAPLESS_IDLE_WAIT:-900}"; then
+    echo "[SKIP] the machine is in use and this opens a window — not interrupting."
+    echo "       It will run cleanly when the desk is free, or set GAPLESS_WINDOWS_OK=1."
+    exit 0
+  fi
+fi
+
 cargo build 2>/dev/null || { echo "build failed"; exit 1; }
 BIN=$(cargo metadata --format-version 1 --no-deps \
       | python3 -c 'import json,sys;print(json.load(sys.stdin)["target_directory"])')/debug/gapless
@@ -242,6 +254,32 @@ check "trim off"        False "$(api "$BASE/api/settings" | field trim_silence)"
 check "out of range is rejected" 400 \
       "$(code -X POST -H "Authorization: Bearer $KEY" -d '{"crossfade_secs":99}' "$BASE/api/settings")"
 check "and did not take effect"  3.0 "$(api "$BASE/api/settings" | field crossfade_secs)"
+
+echo
+echo "=== the listener can be moved, and moved onto itself ==="
+# Rebinding to the SAME port is what the Regenerate-key button does. Before the
+# accept thread was joined on drop, the old socket was still open when the new
+# bind ran: "Address already in use", and the control API stayed DEAD until the
+# app was restarted. It took the operator's API down the first time they used
+# the button, so this check exists.
+SAME=$(api -X POST -d "{\"port\":$PORT}" "$BASE/api/listen")
+check "rebinding to the same port succeeds" "$PORT" \
+      "$(printf '%s' "$SAME" | field port)"
+sleep 1
+check "and the API is still answering afterwards" 200 \
+      "$(code -H "Authorization: Bearer $KEY" "$BASE/api/status")"
+OTHER=$((PORT + 1))
+api -X POST -d "{\"port\":$OTHER}" "$BASE/api/listen" >/dev/null
+sleep 1
+check "moving to another port works"        200 \
+      "$(code -H "Authorization: Bearer $KEY" "http://127.0.0.1:$OTHER/api/status")"
+check "and the old port is released"        000 \
+      "$(curl -s -m 3 -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $KEY" "$BASE/api/status")"
+curl -sf -m 10 -X POST -H "Authorization: Bearer $KEY" -d "{\"port\":$PORT}" \
+     "http://127.0.0.1:$OTHER/api/listen" >/dev/null
+sleep 1
+check "and it can come back"                200 \
+      "$(code -H "Authorization: Bearer $KEY" "$BASE/api/status")"
 
 echo
 echo "=== one state, not two ==="

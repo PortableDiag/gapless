@@ -2383,6 +2383,11 @@ fn status_json(ui: &Rc<Ui>, player: &Arc<Player>) -> Value {
     json!({
         "ok": true,
         "version": VERSION,
+        // So a caller can act on THIS process rather than searching for one by
+        // name. `pgrep` is system-wide: it escapes a private D-Bus session and a
+        // private config directory alike, and it has already been used to signal
+        // the wrong player from inside what looked like a sandbox.
+        "pid": std::process::id(),
         "playing": player.is_playing(),
         "loaded": player.is_loaded(),
         "position_secs": position as f64 / 1e9,

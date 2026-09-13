@@ -38,6 +38,18 @@ if [ -z "${DBUS_SESSION_BUS_ADDRESS_PRIVATE:-}" ]; then
   exec dbus-run-session -- env DBUS_SESSION_BUS_ADDRESS_PRIVATE=1 "$0" "$@"
 fi
 
+# This check launches the real application, so a window appears on the operator's
+# screen. That is an interruption even though it takes no input, so it waits for
+# the machine to be free first. `xprintidle` was installed for this.
+#   GAPLESS_WINDOWS_OK=1  run immediately anyway
+if [ "${GAPLESS_WINDOWS_OK:-}" != "1" ]; then
+  if ! ./scripts/wait-for-idle.sh "${GAPLESS_IDLE_SECS:-10}" "${GAPLESS_IDLE_WAIT:-900}"; then
+    echo "[SKIP] the machine is in use and this opens a window — not interrupting."
+    echo "       It will run cleanly when the desk is free, or set GAPLESS_WINDOWS_OK=1."
+    exit 0
+  fi
+fi
+
 cargo build 2>/dev/null || { echo "build failed"; exit 1; }
 BIN=$(cargo metadata --format-version 1 --no-deps \
       | python3 -c 'import json,sys;print(json.load(sys.stdin)["target_directory"])')/debug/gapless

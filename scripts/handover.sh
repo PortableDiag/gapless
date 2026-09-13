@@ -59,56 +59,159 @@ NEW_URL="http://127.0.0.1:$SCRATCH_PORT"
 api() { curl -sf -m 10 -H "Authorization: Bearer $KEY" "$@"; }
 jq_() { python3 -c "import json,sys;d=json.load(sys.stdin);print(eval(sys.argv[1]))" "$1"; }
 
+# The outgoing player might be running with its control API down — that is
+# exactly the state a broken listener leaves it in, and it is when a handover is
+# most needed. MPRIS is the second way in: it is always there, and it can report
+# the track and pause it, which is all the outgoing side has to do.
+MPRIS_DEST=org.mpris.MediaPlayer2.Gapless
+mpris_up() { gdbus call --session --dest "$MPRIS_DEST" --object-path /org/mpris/MediaPlayer2 \
+  --method org.freedesktop.DBus.Properties.Get org.mpris.MediaPlayer2.Player PlaybackStatus >/dev/null 2>&1; }
+mpris_get() { gdbus call --session --dest "$MPRIS_DEST" --object-path /org/mpris/MediaPlayer2 \
+  --method org.freedesktop.DBus.Properties.Get org.mpris.MediaPlayer2.Player "$1" 2>/dev/null; }
+
+OLD_VIA=api
 if ! api "$OLD_URL/api/status" >/dev/null 2>&1; then
+  if mpris_up; then
+    OLD_VIA=mpris
+    echo "the outgoing player's API is not answering on $PORT — using MPRIS for it instead"
+  fi
+fi
+
+if [ "$OLD_VIA" = "api" ] && ! api "$OLD_URL/api/status" >/dev/null 2>&1; then
   echo "nothing is answering on 127.0.0.1:$PORT — starting a player rather than handing over"
-  setsid "$NEW_BIN" >/dev/null 2>&1 < /dev/null &
+  setsid "$NEW_BIN" >"${TMPDIR:-/tmp}/gapless-start-$$.log" 2>&1 < /dev/null &
   sleep 3
   exit 0
 fi
 
-SNAP=$(api "$OLD_URL/api/status")
-echo "outgoing: $(printf '%s' "$SNAP" | jq_ 'd["track"]["title"]') "\
-"(idx $(printf '%s' "$SNAP" | jq_ 'd["track"]["index"]'), v$(printf '%s' "$SNAP" | jq_ 'd["version"]'))"
+if [ "$OLD_VIA" = "api" ]; then
+  SNAP=$(api "$OLD_URL/api/status")
+  TITLE=$(printf '%s' "$SNAP" | jq_ 'd["track"]["title"]')
+  IDX=$(printf '%s' "$SNAP"  | jq_ 'd["track"]["index"]')
+  VOL=$(printf '%s' "$SNAP"  | jq_ 'd["volume"]')
+  REP=$(printf '%s' "$SNAP"  | jq_ 'd["repeat"]')
+  SHUF=$(printf '%s' "$SNAP" | jq_ 'd["shuffle"]')
+  WAS_PLAYING=$(printf '%s' "$SNAP" | jq_ 'd["playing"]')
+  echo "outgoing: $TITLE (idx $IDX, v$(printf '%s' "$SNAP" | jq_ 'd["version"]'))"
+else
+  # MPRIS gives the title, the volume and whether it is playing. It does NOT
+  # give a queue index, so the replacement is told the FILE instead — which is
+  # better anyway: an index is only meaningful against one queue.
+  TITLE=$(mpris_get Metadata | grep -oP "xesam:title': <'\K[^']+")
+  OLD_URL_FILE=$(mpris_get Metadata | grep -oP "xesam:url': <'\K[^']+")
+  VOL=$(mpris_get Volume | grep -oP '<\K[0-9.]+')
+  case "$(mpris_get PlaybackStatus)" in *Playing*) WAS_PLAYING=True ;; *) WAS_PLAYING=False ;; esac
+  IDX=""; REP=""; SHUF=""
+  echo "outgoing: $TITLE (via MPRIS; its API is down)"
+fi
+[ -n "$VOL" ] || VOL=1.0
 
-IDX=$(printf '%s' "$SNAP"  | jq_ 'd["track"]["index"]')
-VOL=$(printf '%s' "$SNAP"  | jq_ 'd["volume"]')
-REP=$(printf '%s' "$SNAP"  | jq_ 'd["repeat"]')
-SHUF=$(printf '%s' "$SNAP" | jq_ 'd["shuffle"]')
-WAS_PLAYING=$(printf '%s' "$SNAP" | jq_ 'd["playing"]')
+# The outgoing process, taken from the channel we are ALREADY talking to.
+#
+# Never `pgrep`. It matches by name across the whole machine, so it escapes a
+# private D-Bus session and a private XDG_CONFIG_HOME without noticing — this
+# script, run against test binaries inside what looked like a sandbox, found the
+# operator's real player and SIGTERMed it mid-song. The API and the bus are both
+# inherently scoped to the instance being handed over: a private bus has no
+# owner for the MPRIS name unless the private player owns it.
+if [ "$OLD_VIA" = "api" ]; then
+  OLD_PID=$(printf '%s' "$SNAP" | jq_ 'd.get("pid","")')
+else
+  # One step: GetConnectionUnixProcessID takes a well-known name directly, so
+  # there is no owner string to parse. (Parsing one is how this first went
+  # wrong: `grep -oP "'\K[^']+"` matches TWICE on `(':1.2356',)` — the closing
+  # quote opens a second match — and the pid lookup was handed `:1.2356\n,)`.)
+  OLD_PID=$(gdbus call --session --dest org.freedesktop.DBus \
+              --object-path /org/freedesktop/DBus \
+              --method org.freedesktop.DBus.GetConnectionUnixProcessID "$MPRIS_DEST" 2>/dev/null \
+            | grep -oP 'uint32 \K[0-9]+')
+fi
+if [ -z "$OLD_PID" ]; then
+  echo "could not identify the outgoing player from its own API or its bus name;"
+  echo "refusing to guess — nothing was touched."
+  exit 1
+fi
 
 # ---- 1. bring the replacement up, alongside -----------------------------
 START=$(date +%s.%N)
-setsid "$NEW_BIN" --new-instance --api-port "$SCRATCH_PORT" >/dev/null 2>&1 < /dev/null &
+# Keep its stderr. A managed restart that discards it leaves you with nothing to
+# read when the replacement comes up silent — which has happened, and cost two
+# minutes of diagnosis from zero.
+LOG="${TMPDIR:-/tmp}/gapless-handover-$$.log"
+setsid "$NEW_BIN" --new-instance --api-port "$SCRATCH_PORT" >"$LOG" 2>&1 < /dev/null &
 for _ in $(seq 1 200); do api "$NEW_URL/api/status" >/dev/null 2>&1 && break; sleep 0.1; done
 if ! api "$NEW_URL/api/status" >/dev/null 2>&1; then
   echo "the replacement never answered on $SCRATCH_PORT — leaving the current player alone"
+  echo "--- its output ---"; tail -20 "$LOG"
   exit 1
 fi
 echo "replacement up in $(echo "$(date +%s.%N) - $START" | bc | cut -c1-4)s, old one still playing"
 
 # ---- 2. match it, and pre-roll the pipeline -----------------------------
-api -X POST -d "{\"mode\":\"$REP\"}"  "$NEW_URL/api/repeat"  >/dev/null
-api -X POST -d "{\"mode\":\"$SHUF\"}" "$NEW_URL/api/shuffle" >/dev/null
-api -X POST -d "{\"volume\":0.0}"     "$NEW_URL/api/volume"  >/dev/null
-POS=$(api "$OLD_URL/api/status" | jq_ 'd["position_secs"]')
-api -X POST -d "{\"index\":$IDX,\"position_secs\":$POS}" "$NEW_URL/api/play" >/dev/null
+[ -n "$REP" ]  && api -X POST -d "{\"mode\":\"$REP\"}"  "$NEW_URL/api/repeat"  >/dev/null
+[ -n "$SHUF" ] && api -X POST -d "{\"mode\":\"$SHUF\"}" "$NEW_URL/api/shuffle" >/dev/null
+api -X POST -d "{\"volume\":0.0}" "$NEW_URL/api/volume" >/dev/null
+
+# Where the outgoing player is. MPRIS reports microseconds.
+old_position() {
+  if [ "$OLD_VIA" = "api" ]; then
+    api "$OLD_URL/api/status" | jq_ 'd["position_secs"]'
+  else
+    mpris_get Position | grep -oP 'int64 \K[0-9]+' | awk '{printf "%.3f", $1/1000000}'
+  fi
+}
+# Which track. By index when the API told us, by path when MPRIS did.
+play_new() { # $1 = position
+  if [ -n "$IDX" ]; then
+    api -X POST -d "{\"index\":$IDX,\"position_secs\":$1}" "$NEW_URL/api/play" >/dev/null
+  else
+    PATH_JSON=$(FILE="$OLD_URL_FILE" python3 -c '
+import json, os, urllib.parse
+u = os.environ["FILE"]
+print(json.dumps(urllib.parse.unquote(u[7:]) if u.startswith("file://") else u))')
+    IDX=$(api "$NEW_URL/api/queue" | PJ="$PATH_JSON" python3 -c '
+import json, os, sys
+want = json.loads(os.environ["PJ"])
+for t in json.load(sys.stdin)["tracks"]:
+    if t["path"] == want:
+        print(t["index"]); break')
+    [ -n "$IDX" ] && api -X POST -d "{\"index\":$IDX,\"position_secs\":$1}" "$NEW_URL/api/play" >/dev/null
+  fi
+}
+POS=$(old_position)
+play_new "$POS"
 api -X POST "$NEW_URL/api/pause"  >/dev/null
 api -X POST -d "{\"volume\":$VOL}" "$NEW_URL/api/volume" >/dev/null
 
 # ---- 3. the swap: overlap, never a hole ---------------------------------
 SWAP=$(date +%s.%N)
-POS=$(api "$OLD_URL/api/status" | jq_ 'd["position_secs"]')
+POS=$(old_position)
 if [ "$WAS_PLAYING" = "True" ]; then
-  api -X POST -d "{\"index\":$IDX,\"position_secs\":$POS}" "$NEW_URL/api/play" >/dev/null
+  play_new "$POS"
 fi
-api -X POST "$OLD_URL/api/pause" >/dev/null
+if [ "$OLD_VIA" = "api" ]; then
+  api -X POST "$OLD_URL/api/pause" >/dev/null
+else
+  gdbus call --session --dest "$MPRIS_DEST" --object-path /org/mpris/MediaPlayer2 \
+    --method org.mpris.MediaPlayer2.Player.Pause >/dev/null 2>&1
+fi
 echo "swapped in $(echo "$(date +%s.%N) - $SWAP" | bc | cut -c1-5)s"
 
 # ---- 4. retire the old copy, take its port ------------------------------
-api -X POST "$OLD_URL/api/quit" >/dev/null 2>&1
+if [ "$OLD_VIA" = "api" ]; then
+  api -X POST "$OLD_URL/api/quit" >/dev/null 2>&1
+else
+  # No API to ask politely. SIGTERM runs the app's own save-and-quit handler,
+  # so the session is still written; only SIGKILL would lose it.
+  [ -n "$OLD_PID" ] && kill -TERM "$OLD_PID" 2>/dev/null
+fi
 GONE=no
 for _ in $(seq 1 60); do
-  api "$OLD_URL/api/status" >/dev/null 2>&1 || { GONE=yes; break; }
+  if [ "$OLD_VIA" = "api" ]; then
+    api "$OLD_URL/api/status" >/dev/null 2>&1 || { GONE=yes; break; }
+  else
+    kill -0 "${OLD_PID:-0}" 2>/dev/null || { GONE=yes; break; }
+  fi
   sleep 0.25
 done
 if [ "$GONE" != "yes" ]; then

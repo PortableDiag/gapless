@@ -20,8 +20,16 @@
 #
 # Runs on a private D-Bus session and a private XDG_CONFIG_HOME, at volume 0, so
 # a copy already running on your desktop is untouched and nothing makes noise.
+#
 # It does take the keyboard for a few seconds — that is unavoidable, because
-# taking the keyboard is the thing being tested.
+# taking the keyboard is the thing being tested. So it **waits until nobody is
+# using it**, and **gets out of the way the moment they come back**: running this
+# while somebody is typing means two parties fighting over one input queue, their
+# keystrokes landing in the test window and the test's landing in their editor.
+# Both lose, and the result is noise rather than a verdict.
+#
+#   GAPLESS_IDLE_SECS=12   how long the keyboard must be quiet first
+#   GAPLESS_IDLE_WAIT=600  how long to wait for that before giving up
 #
 #   DISPLAY=:0 ./scripts/verify-input.sh
 set -uo pipefail
@@ -41,6 +49,42 @@ check() { # label expected actual
     printf '  [PASS] %-46s %s\n' "$1" "$3"; PASS=$((PASS+1))
   else
     printf '  [FAIL] %-46s got %s, want %s\n' "$1" "$3" "$2"; FAIL=$((FAIL+1))
+  fi
+}
+
+# THIS SCRIPT MOVES THE POINTER AND TAKES THE KEYBOARD. It is opt-in for that
+# reason: run it deliberately, when the machine is free, and never as part of a
+# routine sweep while somebody is at the desk.
+if [ "${GAPLESS_INPUT_OK:-}" != "1" ]; then
+  cat <<'WHY'
+[SKIP] verify-input.sh drives the real window with real pointer and keyboard
+       input, so it takes the mouse and the keyboard away from whoever is at the
+       machine. It does not run unless you say so:
+
+           GAPLESS_INPUT_OK=1 DISPLAY=:0 ./scripts/verify-input.sh
+
+       Everything else in the harness runs without touching your input.
+WHY
+  exit 0
+fi
+
+# Even then: do not take the keyboard out from under somebody who is using it.
+if ! ./scripts/wait-for-idle.sh "${GAPLESS_IDLE_SECS:-12}" "${GAPLESS_IDLE_WAIT:-600}"; then
+  echo "[FAIL] could not get the keyboard to myself — nothing was tested."
+  echo "       Re-run when the machine is free, or raise GAPLESS_IDLE_WAIT."
+  exit 1
+fi
+IDLE_FLOOR=$(( ${GAPLESS_IDLE_SECS:-12} * 1000 / 3 ))
+# A real keypress resets the idle counter. Polling it between our own bursts is
+# how we notice the person came back, without racing them for the focus.
+yield_if_busy() {
+  ms=$(./scripts/wait-for-idle.sh --idle-ms 2>/dev/null)
+  if [ -n "$ms" ] && [ "$ms" -lt "$IDLE_FLOOR" ]; then
+    echo
+    echo "  [STOP] you started typing — releasing the keyboard and abandoning the run."
+    echo "         Nothing is broken; re-run it when the machine is free."
+    kill -9 "${APP:-0}" 2>/dev/null
+    exit 1
   fi
 }
 
@@ -113,9 +157,11 @@ fi
 echo "=== number keys rate the cued track ==="
 check "nothing rated to begin with" 0 "$(stars_for sweep.mp3)"
 for k in 4 2 5; do
+  yield_if_busy
   xdotool key --clearmodifiers "$k"; sleep 1
   check "pressing '$k'" "$k" "$(stars_for sweep.mp3)"
 done
+yield_if_busy
 xdotool key --clearmodifiers 0; sleep 1
 check "pressing '0' clears it" 0 "$(stars_for sweep.mp3)"
 check "and removes the entry rather than storing a zero" 0 "$(rated_count)"
@@ -126,6 +172,7 @@ eval "$(xdotool getwindowgeometry --shell "$WIN")"
 # Row 1 of the list. The cued track is sweep.mp3, which is row 6 — so a rating
 # landing anywhere in the list proves the menu addressed the row under the
 # pointer and not whatever the star strip is pointing at.
+yield_if_busy
 xdotool mousemove --sync $((X + 300)) $((Y + 160)); sleep 0.4
 xdotool click 3; sleep 1.5
 # The popover opens with its first item already focused, so one Down lands on

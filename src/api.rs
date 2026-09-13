@@ -139,10 +139,14 @@ impl ApiRequest {
     }
 }
 
-/// A running listener. Dropping this stops it.
+/// A running listener. Dropping this stops it — and **waits for it to have
+/// stopped**, which is the part that matters.
 pub struct Server {
     port: u16,
     running: Arc<AtomicBool>,
+    /// The accept loop. Joined on drop so the listening socket is provably
+    /// closed before anything tries to bind that port again.
+    accept: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Server {
@@ -159,7 +163,22 @@ impl Drop for Server {
         // something arrives. One connection to ourselves wakes it up so it can
         // see the flag and exit. Failure here is fine: it means nothing is
         // listening any more, which is the state we were trying to reach.
-        let _ = TcpStream::connect(SocketAddr::from(([127, 0, 0, 1], self.port)));
+        let _ = TcpStream::connect_timeout(
+            &SocketAddr::from(([127, 0, 0, 1], self.port)),
+            Duration::from_secs(1),
+        );
+
+        // THEN WAIT FOR IT. Returning here without joining leaves the old
+        // listening socket open for a moment after `drop` has returned, so a
+        // rebind to the same port — which is exactly what the Regenerate-key
+        // button does — fails with "Address already in use" and the control API
+        // stays **dead** until the app is restarted. That shipped in v0.4.0 and
+        // took the operator's API down the first time they pressed the button.
+        // SO_REUSEADDR does not help: the old socket is still *live*, not in
+        // TIME_WAIT.
+        if let Some(accept) = self.accept.take() {
+            let _ = accept.join();
+        }
     }
 }
 
@@ -171,7 +190,7 @@ pub fn start(port: u16, key: String, tx: async_channel::Sender<ApiRequest>) -> s
     let listener = TcpListener::bind(addr)?;
     let running = Arc::new(AtomicBool::new(true));
 
-    std::thread::spawn({
+    let accept = std::thread::spawn({
         let running = running.clone();
         move || {
             for stream in listener.incoming() {
@@ -191,7 +210,11 @@ pub fn start(port: u16, key: String, tx: async_channel::Sender<ApiRequest>) -> s
         }
     });
 
-    Ok(Server { port, running })
+    Ok(Server {
+        port,
+        running,
+        accept: Some(accept),
+    })
 }
 
 fn handle(mut stream: TcpStream, key: &str, tx: &async_channel::Sender<ApiRequest>) -> std::io::Result<()> {
