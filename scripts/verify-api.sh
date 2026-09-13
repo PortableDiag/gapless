@@ -157,7 +157,19 @@ echo
 echo "=== playback (silenced first, so this makes no noise) ==="
 api -X POST -d '{"volume":0.0}' "$BASE/api/volume" >/dev/null
 check "volume is 0" 0.0 "$(api "$BASE/api/status" | field volume)"
-api -X POST -d '{"index":0}' "$BASE/api/play" >/dev/null
+# The response to a play must describe what it started. These three checks exist
+# because driving the API by hand found all three defects the scripted checks
+# above walked straight past: the answer named no track, rating without an index
+# said "nothing is playing" while it was, and `playing` read false about a call
+# that had just succeeded (the pipeline was still transitioning to PLAYING).
+PLAYED=$(api -X POST -d '{"index":0}' "$BASE/api/play")
+check "play names the track it started" yes \
+      "$(printf '%s' "$PLAYED" | python3 -c 'import json,sys;print("yes" if (json.load(sys.stdin).get("track") or {}).get("title") else "no")')"
+check "play reports playing immediately" True \
+      "$(printf '%s' "$PLAYED" | field playing)"
+check "rating with no index rates what is playing" 4 \
+      "$(api -X POST -d '{"stars":4}' "$BASE/api/rating" \
+         | python3 -c 'import json,sys;print(json.load(sys.stdin)["track"]["rating"])')"
 sleep 2
 check "playing"     True "$(api "$BASE/api/status" | field playing)"
 P1=$(api "$BASE/api/status" | field position_secs)

@@ -128,9 +128,9 @@ Two more checks, each written after a real bug got past the ones above:
 
 ```sh
 ./scripts/verify-resume.sh       # a track resumed part-way in must still hand off
-./scripts/verify-mpris-modes.sh  # a mode set over D-Bus must survive a SIGKILL,
-                                 # and must not downgrade favorites shuffle
-./scripts/verify-api.sh          # 41 checks over a real socket against the real app
+./scripts/verify-mpris-modes.sh  # a mode set over D-Bus must survive a SIGKILL, must not
+                                 # downgrade favorites shuffle, and Play must resume
+./scripts/verify-api.sh          # 44 checks over a real socket against the real app
 ```
 
 The weighted shuffle is measured by the unit tests, which print the distribution

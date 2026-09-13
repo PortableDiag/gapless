@@ -41,7 +41,7 @@ pub async fn start(player: Arc<Player>) -> Option<Mpris> {
     mpris.connect_play({
         let player = player.clone();
         move |_| {
-            let _ = start_or_resume(&player);
+            let _ = player.play();
         }
     });
     mpris.connect_pause({
@@ -53,11 +53,7 @@ pub async fn start(player: Arc<Player>) -> Option<Mpris> {
     mpris.connect_play_pause({
         let player = player.clone();
         move |_| {
-            if player.is_loaded() {
-                let _ = player.toggle_pause();
-            } else {
-                let _ = start_or_resume(&player);
-            }
+            let _ = player.play_pause();
         }
     });
     mpris.connect_stop({
@@ -140,16 +136,6 @@ pub async fn start(player: Arc<Player>) -> Option<Mpris> {
     });
 
     Some(mpris)
-}
-
-/// A media key pressed on a freshly launched player must start the queue, not
-/// silently resume a pipeline that has nothing in it.
-fn start_or_resume(player: &Arc<Player>) -> anyhow::Result<()> {
-    if player.is_loaded() {
-        player.set_playing(true)
-    } else {
-        player.play_index(0)
-    }
 }
 
 pub fn publish_track(mpris: &Mpris, index: usize, track: &Track, art: Option<&PathBuf>) {

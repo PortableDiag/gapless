@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
-# Proves that a shuffle/repeat change made *only over MPRIS* survives a crash,
-# and that MPRIS cannot silently downgrade favorites shuffle to a plain one.
+# Three things MPRIS has to get right that nothing else checks: that a mode set
+# only over D-Bus survives a crash, that it cannot silently downgrade favorites
+# shuffle to a plain one, and that Play on a freshly launched player resumes
+# where the last session stopped.
 #
 # The bug case 1 guards against: repeat and shuffle move no pipeline, so an MPRIS
 # SetProperty used to set the flag on the Player and nothing else — no button
@@ -13,6 +15,13 @@
 # Mapping that to plain shuffle turns the user's favorites shuffle off without
 # anyone touching it, and the only visible symptom is that the music stops
 # preferring their favorites.
+#
+# The bug case 4 guards against, found by operating the shipped v0.3.0 rather
+# than by any test: the resume point lived in the GTK front-end's `Ui`, which
+# `mpris.rs` cannot see. So the play *button* resumed where the last session
+# stopped and a media key or a lock-screen Play did **not** — it called
+# `play_index(0)`, started the queue from the top and threw the resume point
+# away. The operator's music came back on the wrong track.
 #
 # So the kill here is deliberate and must stay a SIGKILL: closing the window
 # would let the close handler mask the very bug under test.
@@ -128,8 +137,75 @@ run_case "MPRIS false still turns favorites shuffle off" \
   '{ "volume": 1.0, "repeat": "all", "shuffle": true, "shuffle_mode": "favorites", "trim_silence": true }' \
   false "" all off
 
+# ---------------------------------------------------------------------------
+# 4. Play over MPRIS on a freshly launched player must resume the cued track.
+echo
+echo "MPRIS Play resumes the session"
+
+[ -f testdata/sweep.mp3 ] || ./scripts/make-test-tones.sh >/dev/null 2>&1
+TESTDATA="$PWD/testdata"
+WANT="$TESTDATA/sweep.mp3"          # deliberately NOT the first track in scan order
+
+CFG=$(mktemp -d)
+export XDG_CONFIG_HOME="$CFG"
+mkdir -p "$CFG/gapless"
+cat > "$CFG/gapless/state.json" <<EOF
+{ "volume": 0.0, "repeat": "off", "shuffle": false, "trim_silence": true,
+  "last_source": "$TESTDATA", "last_track": "$WANT", "last_position_secs": 3.0 }
+EOF
+
+"$BIN" >"$CFG/app.log" 2>&1 &
+APP=$!
+sleep 5
+if ! kill -0 "$APP" 2>/dev/null; then
+  echo "  [FAIL] app died on launch:"; cat "$CFG/app.log"; FAILED=1
+else
+  # Wait for the bus name rather than sleeping at it. A fixed sleep raced the
+  # MPRIS server coming up, the Play landed on nothing, and the check reported
+  # an empty title as a failure of the thing it was testing.
+  for _ in $(seq 1 30); do
+    gdbus call --session --dest org.mpris.MediaPlayer2.Gapless \
+      --object-path /org/mpris/MediaPlayer2 \
+      --method org.freedesktop.DBus.Properties.Get \
+      org.mpris.MediaPlayer2.Player PlaybackStatus >/dev/null 2>&1 && break
+    sleep 0.5
+  done
+
+  if ! gdbus call --session --dest org.mpris.MediaPlayer2.Gapless \
+       --object-path /org/mpris/MediaPlayer2 \
+       --method org.mpris.MediaPlayer2.Player.Play >/dev/null 2>&1; then
+    echo "    [FAIL] MPRIS never came up, so Play could not be sent"
+    FAILED=1
+  fi
+
+  got=""
+  for _ in $(seq 1 20); do
+    got=$(gdbus call --session --dest org.mpris.MediaPlayer2.Gapless \
+          --object-path /org/mpris/MediaPlayer2 \
+          --method org.freedesktop.DBus.Properties.Get \
+          org.mpris.MediaPlayer2.Player Metadata 2>/dev/null \
+          | grep -oP "xesam:title': <'\K[^']+")
+    [ -n "$got" ] && break
+    sleep 0.5
+  done
+  # Match on the TITLE TAG, not the filename: sweep.mp3 is tagged
+  # "Linear sweep 200-2200 Hz", and comparing against the file stem is how this
+  # check first reported a false failure against a working fix.
+  echo "    cued:   sweep.mp3 - deliberately not the first track in scan order"
+  echo "    played: $got"
+  case "$(printf '%s' "$got" | tr '[:upper:]' '[:lower:]')" in
+    *sweep*) echo "    [PASS]" ;;
+    "")      echo "    [FAIL] no metadata at all - MPRIS Play did nothing"; FAILED=1 ;;
+    *)       echo "    [FAIL] MPRIS Play ignored the resume point and started the queue instead"
+             FAILED=1 ;;
+  esac
+  kill -9 "$APP" 2>/dev/null; wait "$APP" 2>/dev/null
+fi
+rm -rf "$CFG"
+
+echo
 if [ "$FAILED" = 0 ]; then
-  echo "[PASS] 3/3"
+  echo "[PASS] 4/4"
 else
   echo "[FAIL] see above"
   exit 1

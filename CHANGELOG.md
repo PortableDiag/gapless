@@ -5,6 +5,76 @@ All notable changes to Gapless. Newest first.
 The project is pre-1.0; entries are grouped by release and carry the commit
 that made them.
 
+## v0.3.1 — 2026-09-13
+
+Four defects, **all four found by operating the player rather than by any test
+that existed**. Three of them were in code that shipped hours earlier with a
+green suite; the fourth had been there since v0.1.0.
+
+### Fixed
+
+- **A media key, or a lock-screen Play, ignored the resume point.** The play
+  *button* resumed where the last session stopped. MPRIS did not — it called
+  `play_index(0)`, started the queue from the top and threw the resume point
+  away. Anyone restarting the app and pressing Play on their keyboard rather
+  than in the window got the wrong track.
+
+  The cause was the resume point living in the GTK front-end's `Ui`, which
+  `mpris.rs` cannot see, so `start_or_resume` had no way to reach it and did the
+  only thing it could. It now lives on the `Player` as a **cue**, and `play()` /
+  `play_pause()` are the whole of "press play" for every caller — the button, a
+  media key, MPRIS and the control API all call the same two methods. Anything
+  that reimplements that logic is how the resume point gets lost by one route
+  and not another.
+
+- **`POST /api/play` answered `"track": null`** about a track it had just
+  started, and **`POST /api/rating {"stars":N}` answered 409 "nothing is
+  playing"** while it was playing.
+
+  Both read `ui.focus`, which is set by the `TrackStarted` event — and that
+  arrives on the channel *after* the call that started playback has returned. A
+  caller therefore had to sleep and re-poll to find out what it had just done.
+  Both now go through one `focused_track` helper, which leads with
+  `player.current()` (set synchronously) and falls back to the cued track.
+
+- **`is_playing()` was false for a moment after a successful play.** A GStreamer
+  state change is asynchronous, so the pipeline is still PAUSED with PLAYING
+  pending; reading only the current state made `POST /api/play` report
+  `"playing": false` about a call that had just succeeded, leaving a caller no
+  way to tell "starting" from "refused" except by polling. It now counts the
+  **pending** state, which is exactly the missing information.
+
+- **`Player::play()` deadlocked the whole application** — caught by the harness
+  before release, and worth recording because it is invisible on inspection.
+  Written as `if let Some(x) = self.cued.lock().unwrap().take() { … }`, the
+  temporary `MutexGuard` lives to the end of the `if let` **body** in edition
+  2021, and the body calls `start_at`, which locks the same mutex to clear the
+  cue. The app stayed alive and MPRIS kept answering while every call timed out
+  with the main loop wedged. Take the value into a local first. The three other
+  `if let … lock()` sites in `player.rs` were checked and are safe: their bodies
+  are a single assignment, so the guard drops before any further call.
+
+### Verification
+
+- `scripts/verify-mpris-modes.sh` gains a fourth case: a resume point is seeded,
+  the real app is launched, **Play is sent over MPRIS**, and the track that comes
+  back must be the cued one and not the top of the queue. It waits for the bus
+  name rather than sleeping at it — a fixed sleep raced the MPRIS server coming
+  up, and the check then reported an empty title as a failure of the thing it was
+  testing.
+- `scripts/verify-api.sh` gains three cases, one per API defect above. They exist
+  because the existing 41 walked straight past all three: every scripted check
+  rated by explicit index and read status after a sleep, so nothing ever asked
+  the API a question a person would ask it.
+- The cue's own tests build a **real `Player`** with a `fakesink`. They are
+  deliberately one test function: `Player` installs a bus watch on the glib main
+  context, a main context belongs to the first thread that acquires it, and
+  `cargo test` gives every test its own thread — so a second test building a
+  `Player` fails intermittently, depending on scheduling.
+
+`cargo test` 30/30 · `verify.sh` 6/6 · `verify-resume.sh` 4/4 ·
+`verify-mpris-modes.sh` 4/4 · `verify-api.sh` 44/44
+
 ## v0.3.0 — 2026-09-13
 
 ### Added

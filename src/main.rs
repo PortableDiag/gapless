@@ -119,10 +119,6 @@ struct Ui {
     /// Bumps on every track change so each cached cover gets a fresh filename;
     /// MPRIS clients cache art by URL and won't re-read a path they've seen.
     art_seq: Cell<u64>,
-    /// Where the last session stopped: (queue index, offset in nanoseconds).
-    /// Cued up but *not* started — a player that begins blaring on login is a
-    /// player you uninstall. Consumed by the first press of play.
-    resume: Cell<Option<(usize, u64)>>,
     save_timer: RefCell<Option<glib::SourceId>>,
     last_pos_save: Cell<Option<Instant>>,
 }
@@ -323,7 +319,6 @@ fn build_window(app: &adw::Application) {
         seek_target: Cell::new(None),
         seek_timer: RefCell::new(None),
         art_seq: Cell::new(0),
-        resume: Cell::new(None),
         save_timer: RefCell::new(None),
         last_pos_save: Cell::new(None),
     });
@@ -422,7 +417,7 @@ fn build_window(app: &adw::Application) {
 
     if let Some(source) = saved.valid_last_source() {
         load_source(&ui, &player, source.to_path_buf());
-        restore_last_track(&ui, &saved);
+        restore_last_track(&ui, &player, &saved);
     }
 
     // The key exists whether or not the API is switched on, so the settings
@@ -956,34 +951,22 @@ fn wire_up(
 
     ui.list.connect_row_activated({
         let player = player.clone();
-        let ui = ui.clone();
         move |_, row| {
-            ui.resume.set(None);
             if let Err(e) = player.play_index(row.index() as usize) {
                 eprintln!("play failed: {e}");
             }
         }
     });
 
+    // `Player::play_pause` is the whole of "press play": the cued resume point
+    // if there is one, else carry on, else the top of the queue. A media key and
+    // the control API call the same thing, which is the point — this logic used
+    // to live here, where `mpris.rs` could not reach it.
     ui.play_button.connect_clicked({
         let player = player.clone();
-        let ui = ui.clone();
         move |_| {
-            if !player.is_loaded() {
-                // Pick up where the last session left off, if we cued something.
-                if let Some((track, offset)) = ui.resume.take() {
-                    if let Err(e) = player.play_index_at(track, offset) {
-                        eprintln!("resume failed: {e}");
-                    }
-                    return;
-                }
-                if !ui.tracks.borrow().is_empty() {
-                    let _ = player.play_index(0);
-                    return;
-                }
-            }
-            if let Err(e) = player.toggle_pause() {
-                eprintln!("pause failed: {e}");
+            if let Err(e) = player.play_pause() {
+                eprintln!("play failed: {e}");
             }
         }
     });
@@ -1252,7 +1235,7 @@ fn load_source(ui: &Rc<Ui>, player: &Arc<Player>, path: PathBuf) {
     // A resume point belongs to the source it came from. Opening a different
     // folder abandons it rather than resuming into a coincidental path match.
     if s.last_source.as_deref() != Some(path.as_path()) {
-        ui.resume.set(None);
+        player.clear_cue();
         s.last_track = None;
         s.last_position_secs = 0.0;
     }
@@ -1416,7 +1399,7 @@ fn current_settings(ui: &Rc<Ui>, player: &Arc<Player>) -> Settings {
             s.last_track = Some(track.path.clone());
             s.last_position_secs = player.position() as f64 / 1e9;
         }
-    } else if let Some((i, offset)) = ui.resume.get() {
+    } else if let Some((i, offset)) = player.cued() {
         if let Some(track) = ui.tracks.borrow().get(i) {
             s.last_track = Some(track.path.clone());
             s.last_position_secs = offset as f64 / 1e9;
@@ -1446,7 +1429,7 @@ fn schedule_save(ui: &Rc<Ui>, player: &Arc<Player>) {
 /// but do not start it. Matched by path, so a rescan that renumbers the queue
 /// still lands on the right song, and a track that has since been deleted simply
 /// doesn't resume.
-fn restore_last_track(ui: &Rc<Ui>, saved: &Settings) {
+fn restore_last_track(ui: &Rc<Ui>, player: &Arc<Player>, saved: &Settings) {
     let Some(want) = saved.last_track.as_deref() else { return };
     let found = ui
         .tracks
@@ -1463,7 +1446,7 @@ fn restore_last_track(ui: &Rc<Ui>, saved: &Settings) {
         pos = 0;
     }
 
-    ui.resume.set(Some((i, pos)));
+    player.set_cued(Some((i, pos)));
     ui.now_playing.set_label(&track.title);
     ui.now_artist.set_label(&format!("{} — {}", track.artist, track.album));
     ui.now_detail.set_label(&detail_line(&track));
@@ -1686,7 +1669,6 @@ fn dispatch(ui: &Rc<Ui>, player: &Arc<Player>, req: &ApiRequest) -> ApiResponse 
                     if i >= ui.tracks.borrow().len() {
                         return ApiResponse::error(404, "no track at that index");
                     }
-                    ui.resume.set(None);
                     player.play_index_at(i, pos.unwrap_or(0))
                 }
                 // No index: resume what is cued, else carry on, else start at 0.
@@ -1699,14 +1681,10 @@ fn dispatch(ui: &Rc<Ui>, player: &Arc<Player>, req: &ApiRequest) -> ApiResponse 
                             }
                             None => ApiResponse::error(409, "nothing is loaded to seek in").into_err(),
                         }
-                    } else if player.is_loaded() {
-                        player.set_playing(true)
-                    } else if let Some((track, offset)) = ui.resume.take() {
-                        player.play_index_at(track, offset)
-                    } else if !ui.tracks.borrow().is_empty() {
-                        player.play_index(0)
-                    } else {
+                    } else if ui.tracks.borrow().is_empty() {
                         return ApiResponse::error(409, "nothing loaded — POST /api/open first");
+                    } else {
+                        player.play()
                     }
                 }
             };
@@ -1722,15 +1700,10 @@ fn dispatch(ui: &Rc<Ui>, player: &Arc<Player>, req: &ApiRequest) -> ApiResponse 
         },
 
         ("/api/playpause", _, true) => {
-            let result = if player.is_loaded() {
-                player.toggle_pause().map(|_| ())
-            } else if let Some((track, offset)) = ui.resume.take() {
-                player.play_index_at(track, offset)
-            } else if !ui.tracks.borrow().is_empty() {
-                player.play_index(0)
-            } else {
+            if ui.tracks.borrow().is_empty() {
                 return ApiResponse::error(409, "nothing loaded — POST /api/open first");
-            };
+            }
+            let result = player.play_pause();
             match result {
                 Ok(()) => ApiResponse::ok(status_json(ui, player)),
                 Err(e) => ApiResponse::error(500, &e.to_string()),
@@ -1829,7 +1802,7 @@ fn dispatch(ui: &Rc<Ui>, player: &Arc<Player>, req: &ApiRequest) -> ApiResponse 
                     }
                 }
                 // Neither: rate what is playing, which is what the star strip does.
-                (None, None) => match ui.focus.get() {
+                (None, None) => match focused_track(ui, player) {
                     Some(i) => i,
                     None => return ApiResponse::error(409, "nothing is playing — send index or path"),
                 },
@@ -1993,11 +1966,27 @@ fn track_json(index: usize, t: &Track) -> Value {
     })
 }
 
+/// "The current track", for anything that has to answer the question without a
+/// track number in hand.
+///
+/// **`ui.focus` alone is not enough**, and driving the API by hand is what showed
+/// it: `focus` is set by the `TrackStarted` event, which arrives on the channel
+/// *after* the call that started playback has already returned. So a
+/// `POST /api/play {"index":6}` answered `"track": null`, and a
+/// `POST /api/rating {"stars":5}` answered 409 "nothing is playing" — while it
+/// was playing. `player.current()` is set synchronously by `start_at`, so it
+/// leads; `focus` covers the track merely cued from the last session, which the
+/// panel shows before anything has started.
+fn focused_track(ui: &Rc<Ui>, player: &Arc<Player>) -> Option<usize> {
+    player
+        .current()
+        .or_else(|| ui.focus.get())
+        .or_else(|| player.cued().map(|(i, _)| i))
+}
+
 fn status_json(ui: &Rc<Ui>, player: &Arc<Player>) -> Value {
-    // The track shown in the now-playing panel: playing, paused, or merely cued
-    // from the last session. `focus` is exactly that, and it is what the rating
-    // endpoint defaults to, so status and rating agree on "the current track".
-    let current = ui.focus.get();
+    // Playing, paused, or merely cued from the last session.
+    let current = focused_track(ui, player);
     let track = current.and_then(|i| ui.tracks.borrow().get(i).cloned());
 
     json!({

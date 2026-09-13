@@ -286,6 +286,17 @@ pub struct Player {
     crossfade: Arc<AtomicU64>,
     /// Cap on silence left *inside* a track, in nanoseconds. Zero = leave alone.
     inner_limit: Arc<AtomicU64>,
+    /// Where the last session stopped: (track, offset in nanoseconds). Cued but
+    /// **not** started — a player that begins blaring on login is a player you
+    /// uninstall — and consumed by the first thing that asks to play.
+    ///
+    /// It lives here rather than in the GTK front-end because it is not a UI
+    /// concern: a media key, an MPRIS client and the control API all have to
+    /// resume the same point the play button does. It used to live in `Ui`,
+    /// which `mpris.rs` cannot see, so a lock-screen Play on a freshly launched
+    /// player silently started the queue from track 0 and threw the resume point
+    /// away.
+    cued: Mutex<Option<(usize, u64)>>,
     tx: async_channel::Sender<PlayerEvent>,
     itx: async_channel::Sender<Internal>,
     pub events: async_channel::Receiver<PlayerEvent>,
@@ -352,6 +363,7 @@ impl Player {
             trim_enabled: Arc::new(AtomicBool::new(true)),
             crossfade: Arc::new(AtomicU64::new(0)),
             inner_limit: Arc::new(AtomicU64::new(0)),
+            cued: Mutex::new(None),
             tx,
             itx,
             events,
@@ -369,6 +381,12 @@ impl Player {
         let mut q = self.queue.lock().unwrap();
         q.tracks = tracks;
         q.reorder(None);
+    }
+
+    /// `set_tracks` renumbers everything, so a cue held against the old queue is
+    /// meaningless. Callers that re-cue do so *after* loading.
+    pub fn clear_cue(&self) {
+        *self.cued.lock().unwrap() = None;
     }
 
     pub fn set_repeat(&self, repeat: Repeat) {
@@ -418,6 +436,55 @@ impl Player {
 
     pub fn current(&self) -> Option<usize> {
         self.sched.lock().unwrap().current
+    }
+
+    // ---- the resume point --------------------------------------------
+
+    /// Cue a track without starting it.
+    pub fn set_cued(&self, point: Option<(usize, u64)>) {
+        *self.cued.lock().unwrap() = point;
+    }
+
+    /// Look without consuming — for saving the session while still cued.
+    pub fn cued(&self) -> Option<(usize, u64)> {
+        *self.cued.lock().unwrap()
+    }
+
+    /// Start playing: the cued resume point if there is one, otherwise carry on
+    /// from wherever the pipeline is, otherwise the top of the queue.
+    ///
+    /// This is the whole of "press play" and every caller goes through it — the
+    /// button, a media key, MPRIS, the control API. Anything that reimplements
+    /// it is how the resume point gets lost by one route and not another.
+    pub fn play(&self) -> Result<()> {
+        // Take the cue into a local FIRST. Written as
+        // `if let Some(x) = self.cued.lock().unwrap().take()`, the temporary
+        // `MutexGuard` lives to the end of the `if let` body in edition 2021 —
+        // and the body calls `start_at`, which locks the same mutex to clear the
+        // cue. That is a deadlock: the app stays alive, MPRIS answers, and every
+        // call then times out with the main loop wedged. Found by the harness,
+        // which is the only reason it is not in a release.
+        let cue = self.cued.lock().unwrap().take();
+        if let Some((track, offset)) = cue {
+            return self.play_index_at(track, offset);
+        }
+        if self.is_loaded() {
+            return self.set_playing(true);
+        }
+        let first = self.queue.lock().unwrap().order.first().copied();
+        match first {
+            Some(t) => self.play_index(t),
+            None => Err(anyhow!("nothing loaded")),
+        }
+    }
+
+    /// Play/pause, honouring the resume point when nothing is loaded yet.
+    pub fn play_pause(&self) -> Result<()> {
+        if self.is_loaded() {
+            self.toggle_pause()?;
+            return Ok(());
+        }
+        self.play()
     }
 
     // ---- trimming & crossfade ----------------------------------------
@@ -489,6 +556,9 @@ impl Player {
     }
 
     fn start_at(&self, track: usize, offset: u64) -> Result<()> {
+        // Any explicit start supersedes the cue, so it can never be resumed
+        // later on top of whatever the user actually chose.
+        *self.cued.lock().unwrap() = None;
         {
             let q = self.queue.lock().unwrap();
             if track >= q.tracks.len() {
@@ -546,8 +616,17 @@ impl Player {
         Ok(!playing)
     }
 
+    /// True while the pipeline is playing **or on its way there**.
+    ///
+    /// A state change is asynchronous, so for a moment after `play()` the
+    /// pipeline is still PAUSED with PLAYING pending. Reading only the current
+    /// state made `POST /api/play` answer `"playing": false` about a call that
+    /// had just succeeded — the caller then has no way to tell "starting" from
+    /// "refused" except by polling. The pending state is exactly the missing
+    /// information, and it is what the transport asked for.
     pub fn is_playing(&self) -> bool {
-        self.pipeline.current_state() == gst::State::Playing
+        let (_, current, pending) = self.pipeline.state(gst::ClockTime::ZERO);
+        current == gst::State::Playing || pending == gst::State::Playing
     }
 
     pub fn is_loaded(&self) -> bool {
@@ -1520,5 +1599,85 @@ mod tests {
         let mut one = vec![0usize];
         weighted_shuffle_in_place(&mut one, &[16.0], &mut rng);
         assert_eq!(one, vec![0]);
+    }
+}
+
+#[cfg(test)]
+mod cue_tests {
+    use super::*;
+
+    /// A real `Player` with the audio sink swapped for a `fakesink`, so this runs
+    /// headless like the rest of the suite.
+    fn headless_player() -> Arc<Player> {
+        // Before the element is built, not after: `Player::with_sink` inits too,
+        // but the sink is constructed by the caller and needs a live registry.
+        gst::init().expect("gstreamer must initialise");
+        let sink = gst::ElementFactory::make("fakesink")
+            .property("sync", false)
+            .build()
+            .expect("fakesink is in gstreamer-core");
+        Player::with_sink(Some(sink)).expect("engine must start")
+    }
+
+    fn queued(paths: &[&str]) -> Vec<QueuedTrack> {
+        paths
+            .iter()
+            .map(|p| QueuedTrack {
+                path: PathBuf::from(p),
+                duration_nanos: 180_000_000_000,
+                rating: 0,
+            })
+            .collect()
+    }
+
+    /// Everything about the resume cue, in **one** test on purpose.
+    ///
+    /// `Player` installs a bus watch on the glib main context, and a main context
+    /// is owned by the first thread to acquire it. `cargo test` gives every test
+    /// its own thread, so a second test that builds a `Player` panics with
+    /// "thread default main context already acquired by another thread" — and
+    /// which one panics is down to scheduling, so it fails intermittently. One
+    /// test, one thread, as many `Player`s as it likes.
+    ///
+    /// The defect being guarded, found by operating the shipped app rather than
+    /// by any test: the resume point lived in the GTK front-end's `Ui`, which
+    /// `mpris.rs` cannot see. The play **button** resumed where the last session
+    /// stopped and a media key or a lock-screen Play did **not** — it called
+    /// `play_index(0)`, started the queue from the top and threw the resume point
+    /// away. One cue, on the `Player`, is what makes every caller agree.
+    #[test]
+    fn the_resume_cue_belongs_to_the_player() {
+        let player = headless_player();
+        player.set_tracks(queued(&["/music/a.mp3", "/music/b.mp3", "/music/c.mp3"]));
+
+        assert_eq!(player.cued(), None, "a fresh player has nothing cued");
+
+        player.set_cued(Some((2, 87_500_000_000)));
+        assert_eq!(
+            player.cued(),
+            Some((2, 87_500_000_000)),
+            "the cue must be readable WITHOUT consuming it — saving the session \
+             while still cued depends on that"
+        );
+        assert_eq!(
+            player.cued(),
+            Some((2, 87_500_000_000)),
+            "reading twice must still not consume it"
+        );
+
+        player.clear_cue();
+        assert_eq!(player.cued(), None);
+
+        // A cue against a queue that has been replaced addresses a different
+        // song, so loading a new source must drop it.
+        player.set_cued(Some((1, 12_000_000_000)));
+        player.set_tracks(queued(&["/other/x.mp3", "/other/y.mp3"]));
+        player.clear_cue();
+        assert_eq!(player.cued(), None);
+
+        // `play()` on an empty queue is an error, not a panic and not a silent
+        // no-op — the control API turns it into a 409.
+        let empty = headless_player();
+        assert!(empty.play().is_err());
     }
 }
