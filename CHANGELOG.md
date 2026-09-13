@@ -15,8 +15,9 @@ that made them.
   run overwrote `art-1`, `art-2`… and permanently orphaned everything above its
   own high-water mark.
 
-  Measured on a real install before the fix: **682 MB across 285 files**, for a
-  cache that never needs more than a handful. The newest four are now kept —
+  Measured on a real install before the fix: **283 orphaned cover files**, at
+  ~96 KB each on this library — tens of megabytes of covers nothing would ever
+  read again, growing for as long as the player runs. The newest four are now kept —
   more than one because an MPRIS client fetches art asynchronously and may still
   be reading the previous track's file — and a launch sweeps whatever earlier
   runs left behind. Pruned by the sequence number parsed from the name, not
@@ -50,6 +51,20 @@ that made them.
 
 `cargo test` 33/33 · `verify.sh` 6/6 · `verify-resume.sh` 4/4 ·
 `verify-mpris-modes.sh` 4/4 · `verify-api.sh` 44/44 · `verify-input.sh` 9/9
+
+### Correction to this entry
+
+The first published version of these notes said the leak measured **682 MB
+across 285 files**. The file count was right; the size was not. `~/.cache/gapless`
+also holds the AppImage build scratch (`appimage-build`, `appimage-tools` —
+about 500 MB), which this project's own release script had put there an hour
+earlier, and `du -sh` on the directory counted it as leaked album art.
+
+The leak is real and the fix is unchanged — nothing ever deleted a cover file,
+and the sequence restarting at zero each launch orphans everything above the new
+run's high-water mark. But it was **tens of megabytes, not hundreds**, and the
+number was published before it was checked against what those files actually
+were.
 
 ## v0.3.1 — 2026-09-13
 

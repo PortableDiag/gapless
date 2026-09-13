@@ -1352,13 +1352,13 @@ const ART_CACHE_KEEP: usize = 4;
 /// **This was an unbounded leak**: every track change wrote `art-{seq}` and
 /// nothing ever removed one. Worse, `art_seq` restarts at zero on every launch,
 /// so a new run overwrites `art-1`, `art-2`… and orphans everything above its
-/// own high-water mark permanently. Measured on a real install before the fix:
-/// **682 MB across 285 files**, for a cache that never needs more than a
-/// handful.
+/// own high-water mark permanently.
 ///
 /// Ordered by the sequence number parsed out of the name, not by mtime — mtimes
 /// can be identical or restored out of order, and the number is what the app
 /// actually means by "newer".
+///
+/// Measured on a real install: **283 orphaned cover files** at ~96 KB each.
 fn prune_art_cache(dir: &std::path::Path, keep: usize) {
     let Ok(entries) = std::fs::read_dir(dir) else { return };
     let mut art: Vec<(u64, PathBuf)> = entries
@@ -2103,7 +2103,7 @@ mod art_cache_tests {
         v
     }
 
-    /// The leak this closes was measured at 682 MB across 285 files on a real
+    /// The leak this closes was measured at 283 orphaned cover files on a real
     /// install: every track change wrote one and nothing ever removed one.
     #[test]
     fn only_the_newest_covers_survive() {
