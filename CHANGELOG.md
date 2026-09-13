@@ -5,6 +5,52 @@ All notable changes to Gapless. Newest first.
 The project is pre-1.0; entries are grouped by release and carry the commit
 that made them.
 
+## v0.3.2 — 2026-09-13
+
+### Fixed
+
+- **The album-art cache grew without bound, for ever.** Every track change wrote
+  `~/.cache/gapless/art-{n}` for MPRIS clients to point at, and **nothing ever
+  deleted one**. Worse, the sequence restarts at zero on every launch, so each
+  run overwrote `art-1`, `art-2`… and permanently orphaned everything above its
+  own high-water mark.
+
+  Measured on a real install before the fix: **682 MB across 285 files**, for a
+  cache that never needs more than a handful. The newest four are now kept —
+  more than one because an MPRIS client fetches art asynchronously and may still
+  be reading the previous track's file — and a launch sweeps whatever earlier
+  runs left behind. Pruned by the sequence number parsed from the name, not
+  lexically: `art-9` sorts after `art-10` as a string, which would delete the
+  newest cover and keep nine stale ones.
+
+- **`GET /api/status` reported `position_secs: 0.0` for a cued track.** A track
+  restored from the last session has a position — it is where the resume will
+  start — but nothing was loaded yet, so the pipeline answered zero. A caller was
+  told the track was at the beginning when it was two minutes in, and the number
+  changed under them the instant they pressed play.
+
+### Verification
+
+- **`scripts/verify-input.sh`** — the two rating paths nothing else could reach:
+  the number-key accelerators and the right-click menu on a list row. 9 checks
+  against the real window with real XTEST input.
+
+  It exists because those were the last part of the feature covered only by
+  inspection, and there are two reasons that was hard. **GTK4 ignores synthetic
+  key events** — `xdotool key --window` uses XSendEvent and does nothing at all,
+  silently — so the window has to genuinely hold focus. And **a window manager
+  can refuse focus** to a window that just appeared; KDE did, until the window
+  was mapped and raised first. The script maps, raises, activates, focuses, then
+  *verifies* with `getactivewindow` before sending anything, and **fails rather
+  than skipping** if focus is refused: a check that quietly does nothing is worse
+  than no check.
+
+  It also proves the menu rates **the row under the pointer** and not the track
+  the star strip is pointing at, which is the whole reason the menu exists.
+
+`cargo test` 33/33 · `verify.sh` 6/6 · `verify-resume.sh` 4/4 ·
+`verify-mpris-modes.sh` 4/4 · `verify-api.sh` 44/44 · `verify-input.sh` 9/9
+
 ## v0.3.1 — 2026-09-13
 
 Four defects, **all four found by operating the player rather than by any test

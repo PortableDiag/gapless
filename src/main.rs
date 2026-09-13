@@ -184,6 +184,11 @@ fn build_window(app: &adw::Application) {
     }
     gtk::Window::set_default_icon_name(APP_ID);
 
+    // Whatever previous runs orphaned. Nothing is referencing them: this process
+    // has not published an art URL yet, and `art_seq` is about to restart at zero
+    // and overwrite the low numbers anyway.
+    prune_art_cache(&glib::user_cache_dir().join("gapless"), 0);
+
     let css = gtk::CssProvider::new();
     css.load_from_string(FAVORITES_CSS);
     if let Some(display) = gtk::gdk::Display::default() {
@@ -1336,6 +1341,48 @@ fn listen_for_events(ui: &Rc<Ui>, player: &Arc<Player>) {
     });
 }
 
+/// How many cover files to leave behind. More than one because an MPRIS client
+/// fetches art asynchronously and may still be reading the previous track's
+/// file; deleting it the instant the track changes gives the lock screen a
+/// broken image. Four is a couple of track changes' worth of grace.
+const ART_CACHE_KEEP: usize = 4;
+
+/// Deletes all but the newest `keep` cover files.
+///
+/// **This was an unbounded leak**: every track change wrote `art-{seq}` and
+/// nothing ever removed one. Worse, `art_seq` restarts at zero on every launch,
+/// so a new run overwrites `art-1`, `art-2`… and orphans everything above its
+/// own high-water mark permanently. Measured on a real install before the fix:
+/// **682 MB across 285 files**, for a cache that never needs more than a
+/// handful.
+///
+/// Ordered by the sequence number parsed out of the name, not by mtime — mtimes
+/// can be identical or restored out of order, and the number is what the app
+/// actually means by "newer".
+fn prune_art_cache(dir: &std::path::Path, keep: usize) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    let mut art: Vec<(u64, PathBuf)> = entries
+        .filter_map(Result::ok)
+        .filter_map(|e| {
+            let path = e.path();
+            let seq: u64 = path
+                .file_name()?
+                .to_str()?
+                .strip_prefix("art-")?
+                .parse()
+                .ok()?;
+            Some((seq, path))
+        })
+        .collect();
+    if art.len() <= keep {
+        return;
+    }
+    art.sort_unstable_by_key(|(seq, _)| *seq);
+    for (_, path) in art.iter().take(art.len() - keep) {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
 /// Loads embedded art into the header image and drops a copy in the cache dir
 /// so MPRIS clients (which want a URL, not bytes) have something to point at.
 fn show_cover(ui: &Rc<Ui>, track: &Track) -> Option<PathBuf> {
@@ -1360,6 +1407,7 @@ fn show_cover(ui: &Rc<Ui>, track: &Track) -> Option<PathBuf> {
     std::fs::create_dir_all(&dir).ok()?;
     let path = dir.join(format!("art-{seq}"));
     std::fs::write(&path, &bytes).ok()?;
+    prune_art_cache(&dir, ART_CACHE_KEEP);
     Some(path)
 }
 
@@ -1989,12 +2037,21 @@ fn status_json(ui: &Rc<Ui>, player: &Arc<Player>) -> Value {
     let current = focused_track(ui, player);
     let track = current.and_then(|i| ui.tracks.borrow().get(i).cloned());
 
+    // A cued track has a position even though nothing is loaded yet — it is the
+    // offset the resume will start at. Reporting 0 there told a caller the track
+    // was at the beginning when it was two minutes in, and the number changed
+    // under them the instant they pressed play.
+    let position = match player.current() {
+        Some(_) => player.position(),
+        None => player.cued().map(|(_, offset)| offset).unwrap_or(0),
+    };
+
     json!({
         "ok": true,
         "version": VERSION,
         "playing": player.is_playing(),
         "loaded": player.is_loaded(),
-        "position_secs": player.position() as f64 / 1e9,
+        "position_secs": position as f64 / 1e9,
         "volume": player.volume(),
         "repeat": match player.repeat() {
             Repeat::Off => "off",
@@ -2025,5 +2082,79 @@ impl IntoErr for ApiResponse {
             .and_then(|v| v.as_str())
             .unwrap_or("error")
             .to_string()))
+    }
+}
+
+#[cfg(test)]
+mod art_cache_tests {
+    use super::*;
+
+    fn write(dir: &std::path::Path, name: &str) {
+        std::fs::write(dir.join(name), b"jpeg").unwrap();
+    }
+
+    fn names(dir: &std::path::Path) -> Vec<String> {
+        let mut v: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        v.sort();
+        v
+    }
+
+    /// The leak this closes was measured at 682 MB across 285 files on a real
+    /// install: every track change wrote one and nothing ever removed one.
+    #[test]
+    fn only_the_newest_covers_survive() {
+        let dir = std::env::temp_dir().join(format!("gapless-art-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        for n in 1..=10 {
+            write(&dir, &format!("art-{n}"));
+        }
+        prune_art_cache(&dir, 4);
+        assert_eq!(names(&dir), vec!["art-10", "art-7", "art-8", "art-9"]);
+
+        // keep: 0 is the startup sweep — nothing is referencing anything yet.
+        prune_art_cache(&dir, 0);
+        assert!(names(&dir).is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Ordered by the sequence number, not lexically. `art-9` is NEWER than
+    /// `art-10` by string order, and sorting that way would delete the newest
+    /// cover and keep nine stale ones.
+    #[test]
+    fn ordering_is_numeric_not_lexical() {
+        let dir = std::env::temp_dir().join(format!("gapless-art-lex-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for n in [2u64, 9, 10, 11] {
+            write(&dir, &format!("art-{n}"));
+        }
+        prune_art_cache(&dir, 2);
+        assert_eq!(names(&dir), vec!["art-10", "art-11"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Anything that is not a cover file must be left alone, and fewer files
+    /// than `keep` must not error.
+    #[test]
+    fn it_touches_nothing_else_and_tolerates_an_empty_cache() {
+        let dir = std::env::temp_dir().join(format!("gapless-art-other-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        write(&dir, "art-1");
+        write(&dir, "not-art");
+        write(&dir, "art-notanumber");
+        prune_art_cache(&dir, 0);
+        assert_eq!(names(&dir), vec!["art-notanumber", "not-art"]);
+
+        // A directory that does not exist at all must not panic.
+        prune_art_cache(&dir.join("missing"), 4);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

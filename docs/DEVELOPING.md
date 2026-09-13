@@ -14,7 +14,7 @@ src/
   ratings.rs   ~/.config/gapless/ratings.json — star ratings, 1–5
   api.rs       the local HTTP control API (docs/API.md)
 examples/      diagnostic tools (below)
-scripts/       setup, test-signal generation, verification
+scripts/       setup, test-signal generation, verification (five suites)
 ```
 
 `src/lib.rs` exists so the engine can be driven headlessly by the test harness as

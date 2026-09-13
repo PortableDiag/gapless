@@ -131,6 +131,7 @@ Two more checks, each written after a real bug got past the ones above:
 ./scripts/verify-mpris-modes.sh  # a mode set over D-Bus must survive a SIGKILL, must not
                                  # downgrade favorites shuffle, and Play must resume
 ./scripts/verify-api.sh          # 44 checks over a real socket against the real app
+./scripts/verify-input.sh        # the rating keys and the right-click menu, real input
 ```
 
 The weighted shuffle is measured by the unit tests, which print the distribution
