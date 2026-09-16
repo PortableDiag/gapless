@@ -75,17 +75,46 @@ if ! ./scripts/wait-for-idle.sh "${GAPLESS_IDLE_SECS:-12}" "${GAPLESS_IDLE_WAIT:
   exit 1
 fi
 IDLE_FLOOR=$(( ${GAPLESS_IDLE_SECS:-12} * 1000 / 3 ))
-# A real keypress resets the idle counter. Polling it between our own bursts is
-# how we notice the person came back, without racing them for the focus.
+
+# A real keypress resets the idle counter, which is how we notice the person came
+# back. The catch: `xprintidle` counts OUR keystrokes too — XTEST events are real
+# input as far as X is concerned — so a naive "idle is low, therefore they are
+# typing" check fires on this script's own '4' one second after it sends it, and
+# the run abandons itself at the second check every single time. It did, on every
+# run, for as long as the gate has existed.
+#
+# So we record when we last synthesised input, and only treat a low idle counter
+# as the operator if the input that reset it arrived AFTER our own — with half a
+# second of slack, which is far tighter than a human pause and far looser than
+# the scheduling jitter between sending a key and reading the clock.
+now_ms() { date +%s%3N; }
+OWN_INPUT_AT=0
+
+# Every xdotool call that generates input goes through here, so the bookkeeping
+# cannot be forgotten at a call site.
+xdo() {
+  xdotool "$@"
+  local rc=$?
+  OWN_INPUT_AT=$(now_ms)
+  return $rc
+}
+
 yield_if_busy() {
   ms=$(./scripts/wait-for-idle.sh --idle-ms 2>/dev/null)
-  if [ -n "$ms" ] && [ "$ms" -lt "$IDLE_FLOOR" ]; then
-    echo
-    echo "  [STOP] you started typing — releasing the keyboard and abandoning the run."
-    echo "         Nothing is broken; re-run it when the machine is free."
-    kill -9 "${APP:-0}" 2>/dev/null
-    exit 1
+  [ -n "$ms" ] || return 0
+  [ "$ms" -ge "$IDLE_FLOOR" ] && return 0
+
+  # Something touched the input recently. Was it us?
+  local last_input=$(( $(now_ms) - ms ))
+  if [ "$last_input" -le "$(( OWN_INPUT_AT + 500 ))" ]; then
+    return 0
   fi
+
+  echo
+  echo "  [STOP] you started typing — releasing the keyboard and abandoning the run."
+  echo "         Nothing is broken; re-run it when the machine is free."
+  kill -9 "${APP:-0}" 2>/dev/null
+  exit 1
 }
 
 cargo build 2>/dev/null || { echo "build failed"; exit 1; }
@@ -158,11 +187,11 @@ echo "=== number keys rate the cued track ==="
 check "nothing rated to begin with" 0 "$(stars_for sweep.mp3)"
 for k in 4 2 5; do
   yield_if_busy
-  xdotool key --clearmodifiers "$k"; sleep 1
+  xdo key --clearmodifiers "$k"; sleep 1
   check "pressing '$k'" "$k" "$(stars_for sweep.mp3)"
 done
 yield_if_busy
-xdotool key --clearmodifiers 0; sleep 1
+xdo key --clearmodifiers 0; sleep 1
 check "pressing '0' clears it" 0 "$(stars_for sweep.mp3)"
 check "and removes the entry rather than storing a zero" 0 "$(rated_count)"
 
@@ -173,12 +202,12 @@ eval "$(xdotool getwindowgeometry --shell "$WIN")"
 # landing anywhere in the list proves the menu addressed the row under the
 # pointer and not whatever the star strip is pointing at.
 yield_if_busy
-xdotool mousemove --sync $((X + 300)) $((Y + 160)); sleep 0.4
-xdotool click 3; sleep 1.5
+xdo mousemove --sync $((X + 300)) $((Y + 160)); sleep 0.4
+xdo click 3; sleep 1.5
 # The popover opens with its first item already focused, so one Down lands on
 # the SECOND item. Items run 5,4,3,2,1 then "Clear rating", so this is 4 stars.
-xdotool key Down; sleep 0.4
-xdotool key Return; sleep 1.5
+xdo key Down; sleep 0.4
+xdo key Return; sleep 1.5
 
 check "one track was rated by the menu" 1 "$(rated_count)"
 check "and it was not the cued track"    0 "$(stars_for sweep.mp3)"
