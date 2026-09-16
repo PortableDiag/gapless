@@ -66,4 +66,27 @@ GAPLESS_CROSSFADE=4 cargo run --release --quiet --example capture -- \
   "$OUT/c2.wav" testdata/xf-440.mp3 testdata/xf-880.mp3 2>/dev/null
 check "no resume, 4 s crossfade" "$OUT/c2.wav" 16.0 60
 
+# Force Tempo makes media time and wall-clock time different quantities, and a
+# resume is where the two meet: `skip` is measured in the *track* and the pad
+# offset it becomes is measured on the *clock*. Get that conversion wrong and
+# the follower is misplaced by the skip times the speed — which is the original
+# bug above, reintroduced by a different route and only when the feature is on.
+#
+#   5 s left of track 1, at 1.25x -> 4.0 s
+#   all 10 s of track 2, at 1.25x -> 8.0 s
+echo "=== resumed AND stretched: the skip is in the track, the offset is on the clock ==="
+GAPLESS_SEEK=5 GAPLESS_TARGET_BPM=125 GAPLESS_BPM=100,100 \
+  cargo run --release --quiet --example capture -- \
+  "$OUT/tempo.wav" testdata/xf-440.mp3 testdata/xf-880.mp3 2>/dev/null
+check "resume at 1.25x" "$OUT/tempo.wav" 12.0 60
+
+# The control for it: same seek, same fixtures, tempos ABOVE the target, so
+# nothing is stretched and the answer must be the unstretched 15.0 s. Without
+# this a "resume at 1.25x" that silently ignored the speed would still pass,
+# because 15.0 and 12.0 are only 3 s apart and both look plausible.
+GAPLESS_SEEK=5 GAPLESS_TARGET_BPM=125 GAPLESS_BPM=200,200 \
+  cargo run --release --quiet --example capture -- \
+  "$OUT/tempo-off.wav" testdata/xf-440.mp3 testdata/xf-880.mp3 2>/dev/null
+check "resume, fast tracks untouched" "$OUT/tempo-off.wav" 15.0 60
+
 echo "all resume checks passed"

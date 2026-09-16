@@ -5,9 +5,123 @@ All notable changes to Gapless. Newest first.
 The project is pre-1.0; entries are grouped by release and carry the commit
 that made them.
 
-## Unreleased
+## v0.6.0 — 2026-09-16
+
+### Added
+
+- **Force tempo — set a BPM and every track plays at it.** Pitch-preserving, so a
+  128 BPM track at 1.09x is still in the key it was recorded in. Behind the gear
+  button: a target from 60 to 200 BPM, a stretch ceiling, and a *never slow a
+  track down* switch that is on by default.
+
+  It exists for one complaint — a workout playlist where one slow track is a slow
+  patch in the workout — and every default follows from that. A track already at
+  or above the target is left **completely alone**, verified bit-exact rather
+  than merely by length.
+
+  **Where a tempo comes from.** The file's `TBPM` tag if it has a believable one,
+  otherwise measured: half a minute decoded from 30 s in, reduced to an onset
+  envelope at 10 ms resolution and autocorrelated. Remembered per track in
+  `~/.config/gapless/bpm.json`, so it is worked out once; the *next* track is
+  analysed while the current one plays, so the only track ever heard at the wrong
+  speed is the one that was already playing when you switched it on.
+
+  **A track with no steady tempo is found to have none and left alone**, and that
+  finding is written down. "Nothing known yet" and "nothing there" are two
+  different states all the way out to the API — a player that invented a tempo
+  for a podcast and then played it 30% fast would be indefensible, and one that
+  re-analysed the podcast on every pass would be merely wasteful.
+
+  **The measurement is editable**, because it is a measurement rather than a
+  preference and you can hear when it is wrong. The now-playing panel shows the
+  BPM in a field you can type over; a number you supply wins and is never quietly
+  re-measured, and clearing it throws the measurement away and has another go.
+
+  `GET`/`POST /api/tempo` and four new fields on `/api/settings` do all of it —
+  *the API does everything the window does* is an invariant here.
+
+- **`examples/bpm-info.rs`** — what the estimator makes of a file and how sure it
+  is. It is not a toy: the confidence threshold in `src/bpm.rs` was chosen from
+  its output over real music and things with no beat in them, and the measured
+  spread is recorded beside the constant.
 
 ### Fixed
+
+- **The player could freeze solid if you changed a playback setting twice while
+  paused.** Present since the mixer engine landed; not specific to Force Tempo,
+  and reproduced on v0.5.1 with two crossfade changes and no tempo code in the
+  process at all.
+
+  A branch that has filled its queue sits blocked inside `gst_pad_push` waiting
+  for the mixer to take a buffer, and while the pipeline is PAUSED the mixer
+  never will. That thread holds the pad's stream lock; tearing the branch down
+  calls `set_state(Null)`, which deactivates the pad and wants the same lock. The
+  caller is the GTK main thread, so **the window stops repainting and the control
+  API accepts connections it will never answer** — with nothing printed anywhere,
+  because nothing crashed. From the outside the app is simply hung.
+
+  A branch being *replaced* now gets FLUSH_START on its mixer pad first, which is
+  the one event meant to be sent from another thread for this: it sets the
+  flushing flag without taking the stream lock, so the blocked push returns
+  `FLUSHING` and the streaming thread unwinds.
+
+  **A branch that finished on its own must not be flushed**, and the first
+  version of this fix flushed both. A branch at EOS still has audio inside the
+  mixer that has not been played yet, and throwing it away put 8.71 ms of silence
+  and a 3.45 rad phase step into every track change — a click, on every
+  transition, which is the entire defect this player exists to fix. `verify.sh`
+  caught it immediately. The two cases are now distinct in the code rather than
+  by accident.
+
+- **A branch was retired where its probe is, not where its audio ends.** Harmless
+  while the two were the same pad, which they had always been. With a stretcher
+  in the chain the queue sees EOS while SoundTouch is still holding the last
+  fraction of a second, so the branch was torn down before it had flushed — and
+  before EOS reached the mixer, so nothing downstream ever finalised. The symptom
+  was a render whose audio was perfectly correct and whose WAV header claimed
+  **12,173 seconds**. The EOS probe now lives on the branch's exit pad.
+
+### Verification
+
+- `verify.sh` is now **8 checks**, up from 6: the stretch (20.000 s → 16.000 s at
+  1.25x) and the refusal (a fast track, bit-identical to the untouched baseline).
+
+  The stretch check measures **pitch as well as length**, which is the whole
+  point: naively resampling the audio shortens a render by exactly the same ratio
+  and transposes it up by that ratio. 440 Hz must still be 440 Hz. A deliberately
+  resampled render was fed to the checker and is caught at 550 Hz.
+
+- `verify-resume.sh` is now **6 checks**, up from 4, covering a track resumed
+  part-way in *and* stretched — the skip is measured in the track and the pad
+  offset it becomes is measured on the clock — plus the control where nothing is
+  stretched, without which an implementation that ignored the speed would pass.
+
+- `verify-api.sh` gains the tempo endpoints, including that clearing a tempo
+  means *measure it again* rather than *this track has no tempo*, which are
+  different states and only one of them is ever revisited.
+
+- 69 unit tests, up from 51. The estimator's are run against synthesised click
+  tracks with exactly known answers, and three of them failed on the first run
+  and found two real defects — see below.
+
+### Notes
+
+- **The quarter-frame lag search needed the envelope blurred first**, and without
+  that it was decorative. A 160 BPM beat lands every 37.5 envelope frames, so
+  alternate beats land on alternate sub-frame phases; a sharp envelope therefore
+  genuinely repeats every 75 frames and the estimator reported **80 BPM,
+  confidently** — the exact octave error the fine grid was added to prevent.
+  Interpolating between frames only means something if the signal is band-limited
+  first.
+
+- **Confidence is how far the winning lag stands above the rest of the search,**
+  not its bare correlation. Rectified onset flux has structure at every lag, so
+  the largest of ~280 candidates sits well above zero even for noise, and a fixed
+  `r > 0.1` gate duly reported a confident 74 BPM for white noise.
+
+### Also in this release
+
+#### Fixed
 
 - **`handover.sh` could not retire a player older than v0.5.1.** The outgoing
   pid comes from `GET /api/status`'s `pid` field, which only exists from v0.5.1 —
@@ -18,7 +132,7 @@ that made them.
   version. (It refusing rather than guessing was correct and is kept — it simply
   had one route too few.)
 
-### Documentation
+#### Documentation
 
 - The harness's **desktop etiquette** is now written down in `README.md` and
   `docs/DEVELOPING.md`: which scripts open a window, which take the keyboard, and
@@ -26,9 +140,10 @@ that made them.
   prints `[SKIP]` and exits 0 by default, which looks like a broken script if you
   do not know it is deliberate.
 
-  Tooling and documentation only — **no version bump and no tag.** No
-  application code changed, and publishing an identical binary would push a
-  pointless "update available" to every install.
+  These two landed after v0.5.1 and were held back deliberately: tooling and
+  documentation alone do not earn a version bump, and publishing an identical
+  binary pushes a pointless "update available" to every install. They ship here
+  because there is now application code to ship with them.
 
 ## v0.5.1 — 2026-09-13
 

@@ -7,6 +7,8 @@ src/
   main.rs      GTK4 + libadwaita UI
   player.rs    the engine — audiomixer timeline, scheduling, probes
   silence.rs   finds where the music really starts and stops
+  tempo.rs     Force Tempo's arithmetic, and the media/wall-clock conversion
+  bpm.rs       where a tempo comes from: TBPM tag, or measured; and remembered
   library.rs   folder scan + tag reading (lofty)
   playlist.rs  M3U / M3U8 / PLS
   mpris.rs     MPRIS2 — media keys, lock screen
@@ -30,6 +32,9 @@ cargo run --release --example capture -- out.wav a.mp3 b.mp3
 
 # what does the silence analyser think of these files?
 cargo run --release --example trim-info -- *.mp3
+
+# what does the tempo estimator think, and how sure is it?
+cargo run --release --example bpm-info -- *.mp3
 
 # parse a playlist and print it in playing order
 cargo run --release --example dump-playlist -- some.m3u8
@@ -102,6 +107,31 @@ itself under `dbus-run-session`, which starts its own xdg-desktop-portal: the
 and the verdict is in the last few lines. And because it pipes its own output, a
 GTK startup failure gets stuck in a buffered pipe — redirect to a file rather
 than piping to `tail` while you are debugging one.
+
+### A hung player with no error is a stream-lock deadlock, not a crash
+
+If the window stops repainting and `GET /api/status` times out while the process
+is still alive and `app.log` is empty, nothing crashed — the GTK main thread is
+blocked inside GStreamer. It is almost always a branch being torn down while its
+streaming thread is blocked pushing into a mixer that is not consuming. See
+`Player::dispose_branch`.
+
+Note that the API still answers **401** in this state, because authentication
+happens on the connection thread before the request reaches the main loop. A 401
+from a key you know is right means the player is hung, not that the key is wrong.
+
+`ptrace_scope` is 1 on this machine, so `gdb -p` cannot attach to a sibling. To
+get a backtrace out of a hung test instance, launch it through a shim that calls
+`prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY)` — that lifts it for one process
+without touching the machine's sysctl.
+
+### Never find a test instance with `pgrep`
+
+It matches by name across the whole machine and escapes a private D-Bus session.
+A hung test player still holds its port, so find it with
+`ss -ltnp | grep <port>`, take the pid from there, and confirm
+`readlink /proc/<pid>/exe` is the debug binary before signalling it — a rebuild
+makes that path end in `(deleted)`, which a naive exact match will refuse.
 
 ## Before you commit
 

@@ -1,12 +1,14 @@
 use adw::prelude::*;
 use gapless::api::{self, ApiRequest, ApiResponse};
 use gapless::autostart;
+use gapless::bpm::{self, Bpm, BpmStore, Source as BpmSource};
 use gapless::library::{self, Track};
 use gapless::playlist;
 use gapless::player::{Player, PlayerEvent, QueuedTrack, Repeat, Shuffle};
 use gapless::ratings::{self, Ratings};
 use gapless::share;
 use gapless::settings::Settings;
+use gapless::tempo;
 use serde_json::{json, Value};
 use gapless::mpris;
 use gtk::glib;
@@ -89,6 +91,18 @@ struct Ui {
     trim_switch: RefCell<Option<gtk::Switch>>,
     xfade_scale: RefCell<Option<gtk::Scale>>,
     inner_scale: RefCell<Option<gtk::Scale>>,
+    /// Force Tempo's four controls, same reasoning again.
+    tempo_switch: RefCell<Option<gtk::Switch>>,
+    tempo_scale: RefCell<Option<gtk::Scale>>,
+    stretch_scale: RefCell<Option<gtk::Scale>>,
+    only_faster_switch: RefCell<Option<gtk::Switch>>,
+    /// The now-playing panel's "128 BPM → 1.09x" line, and the entry that lets
+    /// you type over a measurement you can hear is wrong.
+    bpm_entry: RefCell<Option<gtk::Entry>>,
+    bpm_note: RefCell<Option<gtk::Label>>,
+    /// Per-track tempos, persisted. The engine keeps its own copy for
+    /// scheduling; this is the one that survives the process.
+    bpms: RefCell<BpmStore>,
     /// The running control API, if it is switched on. Dropping it stops it.
     api: RefCell<Option<api::Server>>,
     api_tx: async_channel::Sender<ApiRequest>,
@@ -355,6 +369,13 @@ fn build_window(app: &adw::Application) {
         trim_switch: RefCell::new(None),
         xfade_scale: RefCell::new(None),
         inner_scale: RefCell::new(None),
+        tempo_switch: RefCell::new(None),
+        tempo_scale: RefCell::new(None),
+        stretch_scale: RefCell::new(None),
+        only_faster_switch: RefCell::new(None),
+        bpm_entry: RefCell::new(None),
+        bpm_note: RefCell::new(None),
+        bpms: RefCell::new(BpmStore::load()),
         api: RefCell::new(None),
         api_tx,
         api_key: RefCell::new(String::new()),
@@ -390,10 +411,17 @@ fn build_window(app: &adw::Application) {
     star_row.append(&gtk::Separator::new(gtk::Orientation::Vertical));
     star_row.append(&ui.share_button);
 
+    // The tempo row. Hidden entirely while Force Tempo is off — unlike the
+    // settings controls, which grey out, this one has nothing to say when the
+    // feature is not running and would just be a number nobody asked for under
+    // every track.
+    let tempo_row = build_tempo_row(&ui, &player);
+
     let text_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
     text_box.append(&ui.now_playing);
     text_box.append(&ui.now_artist);
     text_box.append(&ui.now_detail);
+    text_box.append(&tempo_row);
     text_box.append(&star_row);
     text_box.set_hexpand(true);
     text_box.set_valign(gtk::Align::Center);
@@ -470,6 +498,13 @@ fn build_window(app: &adw::Application) {
     player.set_trim_silence(saved.trim_silence);
     player.set_crossfade((saved.crossfade_secs.clamp(0.0, 10.0) * 1e9) as u64);
     player.set_inner_limit((saved.inner_silence_secs.clamp(0.0, 10.0) * 1e9) as u64);
+    // Force Tempo's knobs before its switch: turning it on is what triggers a
+    // reschedule, and it should reschedule against the settings the user
+    // actually left it on, not the defaults.
+    player.set_target_bpm(saved.target_bpm);
+    player.set_max_change_percent(saved.max_stretch_percent);
+    player.set_only_faster(saved.only_faster);
+    player.set_force_tempo(saved.force_tempo);
     set_repeat_look(&ui, player.repeat());
     set_shuffle_look(&ui, player.shuffle());
 
@@ -602,6 +637,8 @@ fn build_prefs(ui: &Rc<Ui>, player: &Arc<Player>, saved: &Settings) -> gtk::Menu
         .css_classes(["heading"])
         .build();
 
+    let tempo_section = build_tempo_prefs(ui, player, saved);
+
     // Whether we launch at login is the *file's* business, not state.json's —
     // see src/autostart.rs. So the switch reads its initial state from disk.
     let login_switch = gtk::Switch::builder()
@@ -658,6 +695,8 @@ fn build_prefs(ui: &Rc<Ui>, player: &Arc<Player>, saved: &Settings) -> gtk::Menu
     content.append(&inner_scale);
     content.append(&inner_label);
     content.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+    content.append(&tempo_section);
+    content.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
     content.append(&login_row);
 
     content.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
@@ -692,6 +731,375 @@ fn build_prefs(ui: &Rc<Ui>, player: &Arc<Player>, saved: &Settings) -> gtk::Menu
     *ui.inner_scale.borrow_mut() = Some(inner_scale);
 
     button
+}
+
+/// Force Tempo: set a BPM and every track plays at it.
+///
+/// Four controls, and every default follows from the one complaint the feature
+/// exists to answer — a workout playlist where one slow track is a slow patch in
+/// the workout. See `src/tempo.rs` for the arithmetic and `src/bpm.rs` for where
+/// a tempo comes from.
+///
+/// The three dependent controls are desensitised rather than hidden when the
+/// switch is off: a control that vanishes takes its explanation with it, and the
+/// numbers are the whole reason someone opens this section.
+fn build_tempo_prefs(ui: &Rc<Ui>, player: &Arc<Player>, saved: &Settings) -> gtk::Box {
+    let section = gtk::Box::new(gtk::Orientation::Vertical, 8);
+
+    let tempo_switch = gtk::Switch::builder()
+        .active(saved.force_tempo)
+        .valign(gtk::Align::Center)
+        .build();
+
+    let head_row = gtk::Box::builder().spacing(12).build();
+    let head_text = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    let h1 = gtk::Label::builder().label("Force tempo").xalign(0.0).css_classes(["heading"]).build();
+    let h2 = gtk::Label::builder()
+        .label("Plays every track at one pace, without moving the pitch")
+        .xalign(0.0)
+        .wrap(true)
+        .css_classes(["dim-label", "caption"])
+        .build();
+    head_text.append(&h1);
+    head_text.append(&h2);
+    head_text.set_hexpand(true);
+    head_row.append(&head_text);
+    head_row.append(&tempo_switch);
+
+    let target_label = gtk::Label::builder()
+        .label(target_text(saved.target_bpm))
+        .xalign(0.0)
+        .css_classes(["dim-label", "caption"])
+        .build();
+    let target_scale = gtk::Scale::with_range(
+        gtk::Orientation::Horizontal,
+        tempo::MIN_TARGET_BPM as f64,
+        tempo::MAX_TARGET_BPM as f64,
+        1.0,
+    );
+    target_scale.set_value(saved.target_bpm as f64);
+    target_scale.set_draw_value(false);
+    target_scale.set_width_request(240);
+    target_scale.set_hexpand(true);
+    for tick in [60.0, 100.0, 140.0, 180.0, 200.0] {
+        target_scale.add_mark(tick, gtk::PositionType::Bottom, None);
+    }
+
+    let stretch_label = gtk::Label::builder()
+        .label(stretch_text(saved.max_stretch_percent))
+        .xalign(0.0)
+        .wrap(true)
+        .css_classes(["dim-label", "caption"])
+        .build();
+    let stretch_scale = gtk::Scale::with_range(
+        gtk::Orientation::Horizontal,
+        5.0,
+        tempo::MAX_STRETCH_PERCENT as f64,
+        5.0,
+    );
+    stretch_scale.set_value(saved.max_stretch_percent.max(5) as f64);
+    stretch_scale.set_draw_value(false);
+    stretch_scale.set_width_request(240);
+    for tick in [10.0, 20.0, 30.0, 40.0, 50.0] {
+        stretch_scale.add_mark(tick, gtk::PositionType::Bottom, None);
+    }
+    let stretch_heading =
+        gtk::Label::builder().label("Most a track may be stretched").xalign(0.0).build();
+
+    let only_faster_switch = gtk::Switch::builder()
+        .active(saved.only_faster)
+        .valign(gtk::Align::Center)
+        .build();
+    let of_row = gtk::Box::builder().spacing(12).build();
+    let of_text = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    let o1 = gtk::Label::builder().label("Never slow a track down").xalign(0.0).build();
+    let o2 = gtk::Label::builder()
+        .label("A track already fast enough is left completely alone")
+        .xalign(0.0)
+        .wrap(true)
+        .css_classes(["dim-label", "caption"])
+        .build();
+    of_text.append(&o1);
+    of_text.append(&o2);
+    of_text.set_hexpand(true);
+    of_row.append(&of_text);
+    of_row.append(&only_faster_switch);
+
+    // Everything below the switch depends on it, so it all greys out together.
+    let dependents: Vec<gtk::Widget> = vec![
+        target_scale.clone().upcast(),
+        target_label.clone().upcast(),
+        stretch_heading.clone().upcast(),
+        stretch_scale.clone().upcast(),
+        stretch_label.clone().upcast(),
+        of_row.clone().upcast(),
+    ];
+    let set_sensitive = {
+        let dependents = dependents.clone();
+        move |on: bool| {
+            for w in &dependents {
+                w.set_sensitive(on);
+            }
+        }
+    };
+    set_sensitive(saved.force_tempo);
+
+    tempo_switch.connect_state_set({
+        let player = player.clone();
+        let ui = ui.clone();
+        let set_sensitive = set_sensitive.clone();
+        move |_, on| {
+            player.set_force_tempo(on);
+            set_sensitive(on);
+            // The panel's BPM line only means anything while the feature is on.
+            refresh_tempo_note(&ui, &player);
+            schedule_save(&ui, &player);
+            glib::Propagation::Proceed
+        }
+    });
+
+    target_scale.connect_value_changed({
+        let player = player.clone();
+        let ui = ui.clone();
+        let label = target_label.clone();
+        move |scale| {
+            let bpm = scale.value().round() as u32;
+            player.set_target_bpm(bpm);
+            label.set_label(&target_text(bpm));
+            refresh_tempo_note(&ui, &player);
+            schedule_save(&ui, &player);
+        }
+    });
+
+    stretch_scale.connect_value_changed({
+        let player = player.clone();
+        let ui = ui.clone();
+        let label = stretch_label.clone();
+        move |scale| {
+            let pct = scale.value().round() as u32;
+            player.set_max_change_percent(pct);
+            label.set_label(&stretch_text(pct));
+            refresh_tempo_note(&ui, &player);
+            schedule_save(&ui, &player);
+        }
+    });
+
+    only_faster_switch.connect_state_set({
+        let player = player.clone();
+        let ui = ui.clone();
+        move |_, on| {
+            player.set_only_faster(on);
+            refresh_tempo_note(&ui, &player);
+            schedule_save(&ui, &player);
+            glib::Propagation::Proceed
+        }
+    });
+
+    section.append(&head_row);
+    section.append(&target_scale);
+    section.append(&target_label);
+    section.append(&stretch_heading);
+    section.append(&stretch_scale);
+    section.append(&stretch_label);
+    section.append(&of_row);
+
+    *ui.tempo_switch.borrow_mut() = Some(tempo_switch);
+    *ui.tempo_scale.borrow_mut() = Some(target_scale);
+    *ui.stretch_scale.borrow_mut() = Some(stretch_scale);
+    *ui.only_faster_switch.borrow_mut() = Some(only_faster_switch);
+
+    section
+}
+
+/// The now-playing panel's tempo row: this track's BPM, in a field you can type
+/// over, and what the player is doing with it.
+///
+/// **The number is editable because it is a measurement, not a preference**, and
+/// you can hear when it is wrong. A number the user supplies wins and is never
+/// quietly re-measured; clearing the field throws the measurement away and has
+/// another go — which is a different thing from "this track has no tempo", and
+/// `bpm::BpmStore` keeps them as different states.
+fn build_tempo_row(ui: &Rc<Ui>, player: &Arc<Player>) -> gtk::Box {
+    let row = gtk::Box::builder().spacing(6).halign(gtk::Align::Start).build();
+
+    let entry = gtk::Entry::builder()
+        .max_length(5)
+        .width_chars(5)
+        .max_width_chars(5)
+        .placeholder_text("BPM")
+        .tooltip_text("This track's tempo. Type over it if the measurement is wrong; clear it to measure again.")
+        .build();
+
+    let note = gtk::Label::builder()
+        .xalign(0.0)
+        .css_classes(["dim-label", "caption"])
+        .build();
+
+    let commit = {
+        let ui = ui.clone();
+        let player = player.clone();
+        move |entry: &gtk::Entry| {
+            let Some(track) = ui.focus.get() else { return };
+            let Some(path) = ui.tracks.borrow().get(track).map(|t| t.path.clone()) else {
+                return;
+            };
+            match bpm::parse_bpm(&entry.text()) {
+                Ok(value) => {
+                    entry.remove_css_class("error");
+                    {
+                        let mut store = ui.bpms.borrow_mut();
+                        store.set_user(&path, value);
+                        store.save();
+                    }
+                    match value {
+                        // A typed number goes straight to the engine.
+                        Some(v) => player.set_track_tempo(&path, Some(v)),
+                        // Cleared: forget it and measure again. The engine has to
+                        // forget too, or it would keep scheduling against the
+                        // number that was just thrown away.
+                        None => player.forget_track_tempo(&path),
+                    }
+                    refresh_tempo_note(&ui, &player);
+                }
+                // Refused rather than clamped into a lie — and said so on the
+                // widget, because a silently ignored entry looks like a bug.
+                Err(_) => entry.add_css_class("error"),
+            }
+        }
+    };
+
+    entry.connect_activate(commit.clone());
+    // Also on focus-out, so clicking away commits rather than silently discarding
+    // what was typed.
+    let focus = gtk::EventControllerFocus::new();
+    focus.connect_leave({
+        let entry = entry.clone();
+        let commit = commit.clone();
+        move |_| commit(&entry)
+    });
+    entry.add_controller(focus);
+
+    row.append(&entry);
+    row.append(&note);
+
+    *ui.bpm_entry.borrow_mut() = Some(entry);
+    *ui.bpm_note.borrow_mut() = Some(note);
+    row
+}
+
+/// Repaint the tempo row for whatever track the panel is describing.
+///
+/// Every state it can be in says something different, and saying the wrong one
+/// is worse than saying nothing: "measuring…" while a track is playing at 1.0x
+/// is a promise; "no steady tempo" is a finding; and a track left alone because
+/// it is already fast enough is not the same as one left alone because nothing
+/// is known about it.
+fn refresh_tempo_note(ui: &Rc<Ui>, player: &Arc<Player>) {
+    let (Some(entry), Some(note)) =
+        (ui.bpm_entry.borrow().clone(), ui.bpm_note.borrow().clone())
+    else {
+        return;
+    };
+
+    let on = player.force_tempo();
+    entry.set_visible(on);
+    note.set_visible(on);
+    if !on {
+        return;
+    }
+
+    let Some(track) = ui.focus.get() else {
+        entry.set_text("");
+        entry.set_sensitive(false);
+        note.set_label("");
+        return;
+    };
+    let Some(path) = ui.tracks.borrow().get(track).map(|t| t.path.clone()) else {
+        return;
+    };
+    entry.set_sensitive(true);
+
+    let known = ui.bpms.borrow().get(&path);
+    let text = match known {
+        Some(Bpm::Known { bpm: value, source }) => {
+            if !entry.has_focus() {
+                entry.set_text(&bpm::format_bpm(value));
+            }
+            let speed = tempo::speed_for(
+                value,
+                player.target_bpm(),
+                player.max_change_percent(),
+                player.only_faster(),
+            );
+            let origin = match source {
+                BpmSource::Tag => "from the file's tag",
+                BpmSource::Measured => "measured",
+                BpmSource::User => "yours",
+            };
+            if tempo::is_unchanged(speed) {
+                format!("BPM ({origin}) — already there, left alone")
+            } else {
+                format!(
+                    "BPM ({origin}) → {} = {} BPM",
+                    tempo::format_speed(speed),
+                    bpm::format_bpm(tempo::effective_bpm(value, speed))
+                )
+            }
+        }
+        Some(Bpm::None) => {
+            if !entry.has_focus() {
+                entry.set_text("");
+            }
+            "No steady tempo in this one — played unchanged".to_string()
+        }
+        None => {
+            if !entry.has_focus() {
+                entry.set_text("");
+            }
+            "Working out the tempo…".to_string()
+        }
+    };
+    note.set_label(&text);
+}
+
+/// A measurement landed. Persist it, hand it to the engine, and repaint if it is
+/// the track on screen.
+///
+/// Persisting matters more than it looks: the engine's copy dies with the
+/// process, and re-measuring a library every session would be a decode per track
+/// for an answer that cannot change.
+fn on_tempo_measured(ui: &Rc<Ui>, player: &Arc<Player>, track: usize, value: Option<f64>) {
+    let Some(path) = ui.tracks.borrow().get(track).map(|t| t.path.clone()) else {
+        return;
+    };
+    {
+        let mut store = ui.bpms.borrow_mut();
+        // `record` refuses to overwrite a number the user typed, so an analysis
+        // that was already in flight when they typed cannot land on top of it.
+        let source = if bpm::from_tag(&path).is_some() { BpmSource::Tag } else { BpmSource::Measured };
+        store.record(
+            &path,
+            match value {
+                Some(v) => Bpm::Known { bpm: v, source },
+                None => Bpm::None,
+            },
+        );
+        store.save();
+    }
+    if ui.focus.get() == Some(track) {
+        refresh_tempo_note(ui, player);
+    }
+}
+
+fn target_text(bpm: u32) -> String {
+    format!("Bring every track to {bpm} BPM")
+}
+
+fn stretch_text(percent: u32) -> String {
+    format!(
+        "Up to {percent}% faster. A track that cannot reach the target inside \
+         this goes as far as it allows rather than further."
+    )
 }
 
 /// The control-API section of the settings popover: the switch, the port, and
@@ -1452,6 +1860,23 @@ fn load_source(ui: &Rc<Ui>, player: &Arc<Player>, path: PathBuf) {
             })
             .collect(),
     );
+    // Hand the engine every tempo we already know. Without this a library is
+    // re-measured from scratch each session — a decode per track for an answer
+    // that cannot change — and the scheduler would stall on the first track
+    // waiting for a measurement that is already sitting on disk.
+    {
+        let store = ui.bpms.borrow();
+        for track in &tracks {
+            match store.get(&track.path) {
+                Some(Bpm::Known { bpm: value, .. }) => {
+                    player.set_track_tempo(&track.path, Some(value))
+                }
+                Some(Bpm::None) => player.set_track_tempo(&track.path, None),
+                None => {}
+            }
+        }
+    }
+
     *ui.tracks.borrow_mut() = tracks;
     ui.focus.set(None);
     set_stars_look(ui, None);
@@ -1494,6 +1919,7 @@ fn listen_for_events(ui: &Rc<Ui>, player: &Arc<Player>) {
                     ui.now_detail.set_label(&detail_line(&track));
                     ui.focus.set(Some(i));
                     set_stars_look(&ui, Some(track.rating));
+                    refresh_tempo_note(&ui, &player);
 
                     let art = show_cover(&ui, &track);
 
@@ -1503,6 +1929,9 @@ fn listen_for_events(ui: &Rc<Ui>, player: &Arc<Player>) {
                     if let Some(m) = &mpris {
                         mpris::publish_track(m, i, &track, art.as_ref());
                     }
+                }
+                PlayerEvent::TempoMeasured { track, bpm } => {
+                    on_tempo_measured(&ui, &player, track, bpm);
                 }
                 PlayerEvent::Position { pos, dur } => {
                     let settled = ui
@@ -1647,6 +2076,55 @@ fn detail_line(track: &Track) -> String {
     parts.join("  ·  ")
 }
 
+fn settings_json(player: &Arc<Player>) -> Value {
+    json!({
+        "ok": true,
+        "trim_silence": player.trim_silence(),
+        "crossfade_secs": player.crossfade() as f64 / 1e9,
+        "inner_silence_secs": player.inner_limit() as f64 / 1e9,
+        "force_tempo": player.force_tempo(),
+        "target_bpm": player.target_bpm(),
+        "max_stretch_percent": player.max_change_percent(),
+        "only_faster": player.only_faster(),
+    })
+}
+
+/// One track's tempo, as three separate facts: what is known, where it came
+/// from, and what the player will therefore do with it.
+///
+/// `state` is the part worth getting right. "unknown" and "none" are different
+/// answers — nobody has looked, versus analysed and there is no steady tempo —
+/// and a caller deciding whether to wait or to move on needs to tell them apart.
+fn tempo_json(ui: &Rc<Ui>, player: &Arc<Player>, index: usize, path: &std::path::Path) -> Value {
+    let known = ui.bpms.borrow().get(path);
+    let (state, value, source) = match known {
+        Some(Bpm::Known { bpm: v, source }) => (
+            "known",
+            Some(v),
+            Some(match source {
+                BpmSource::Tag => "tag",
+                BpmSource::Measured => "measured",
+                BpmSource::User => "user",
+            }),
+        ),
+        Some(Bpm::None) => ("none", None, None),
+        None => ("unknown", None, None),
+    };
+    let speed = player.speed_for_track(index);
+    json!({
+        "ok": true,
+        "index": index,
+        "path": path,
+        "state": state,
+        "bpm": value,
+        "source": source,
+        "force_tempo": player.force_tempo(),
+        "speed": speed,
+        "speed_text": tempo::format_speed(speed),
+        "effective_bpm": value.map(|v| tempo::effective_bpm(v, speed)),
+    })
+}
+
 fn current_settings(ui: &Rc<Ui>, player: &Arc<Player>) -> Settings {
     let mut s = Settings::load();
     s.volume = player.volume();
@@ -1660,6 +2138,10 @@ fn current_settings(ui: &Rc<Ui>, player: &Arc<Player>) -> Settings {
     s.trim_silence = player.trim_silence();
     s.crossfade_secs = player.crossfade() as f64 / 1e9;
     s.inner_silence_secs = player.inner_limit() as f64 / 1e9;
+    s.force_tempo = player.force_tempo();
+    s.target_bpm = player.target_bpm();
+    s.max_stretch_percent = player.max_change_percent();
+    s.only_faster = player.only_faster();
 
     // Only overwrite the resume point if something is actually loaded. Otherwise
     // the first setting the user touches after launch would wipe the position we
@@ -1894,7 +2376,9 @@ fn dispatch(ui: &Rc<Ui>, player: &Arc<Player>, req: &ApiRequest) -> ApiResponse 
                 "POST /api/rating":    "{index|path, stars: 0-5}",
                 "POST /api/open":      "{path} — a folder or a playlist file",
                 "GET  /api/settings":  "playback settings",
-                "POST /api/settings":  "{trim_silence?, crossfade_secs?, inner_silence_secs?}",
+                "POST /api/settings":  "{trim_silence?, crossfade_secs?, inner_silence_secs?, force_tempo?, target_bpm?, max_stretch_percent?, only_faster?}",
+                "GET  /api/tempo":     "{index|path} — a track's BPM, and the speed it will play at",
+                "POST /api/tempo":     "{index|path, bpm?} — type a tempo over the measurement; omit bpm to measure again",
                 "POST /api/share":     "{index|path, mode?: clipboard|details, dest?} — everything the Share button does",
                 "POST /api/listen":    "{port} — move the API to another port, for a handover",
                 "GET  /api/autostart": "whether Gapless starts at login",
@@ -2111,12 +2595,7 @@ fn dispatch(ui: &Rc<Ui>, player: &Arc<Player>, req: &ApiRequest) -> ApiResponse 
             ApiResponse::ok(json!({ "ok": true, "count": count }))
         }
 
-        ("/api/settings", true, _) => ApiResponse::ok(json!({
-            "ok": true,
-            "trim_silence": player.trim_silence(),
-            "crossfade_secs": player.crossfade() as f64 / 1e9,
-            "inner_silence_secs": player.inner_limit() as f64 / 1e9,
-        })),
+        ("/api/settings", true, _) => ApiResponse::ok(settings_json(player)),
 
         ("/api/settings", _, true) => {
             let mut changed = Vec::new();
@@ -2150,16 +2629,143 @@ fn dispatch(ui: &Rc<Ui>, player: &Arc<Player>, req: &ApiRequest) -> ApiResponse 
                 }
                 changed.push("inner_silence_secs");
             }
-            if changed.is_empty() {
-                return ApiResponse::error(400, "send at least one of trim_silence, crossfade_secs, inner_silence_secs");
+            // Force Tempo. Same discipline as above: drive the widget where there
+            // is one, so an API call and a click land on exactly the same path
+            // and the popover never shows something that is not true.
+            if let Some(on) = req.bool("force_tempo") {
+                match ui.tempo_switch.borrow().as_ref() {
+                    Some(sw) => sw.set_active(on),
+                    None => player.set_force_tempo(on),
+                }
+                changed.push("force_tempo");
             }
-            ApiResponse::ok(json!({
-                "ok": true,
-                "changed": changed,
-                "trim_silence": player.trim_silence(),
-                "crossfade_secs": player.crossfade() as f64 / 1e9,
-                "inner_silence_secs": player.inner_limit() as f64 / 1e9,
-            }))
+            if let Some(v) = req.f64("target_bpm") {
+                let bpm = v.round() as i64;
+                if !(tempo::MIN_TARGET_BPM as i64..=tempo::MAX_TARGET_BPM as i64).contains(&bpm) {
+                    return ApiResponse::error(
+                        400,
+                        &format!(
+                            "target_bpm must be {} to {}",
+                            tempo::MIN_TARGET_BPM,
+                            tempo::MAX_TARGET_BPM
+                        ),
+                    );
+                }
+                match ui.tempo_scale.borrow().as_ref() {
+                    Some(scale) => scale.set_value(bpm as f64),
+                    None => player.set_target_bpm(bpm as u32),
+                }
+                changed.push("target_bpm");
+            }
+            if let Some(v) = req.f64("max_stretch_percent") {
+                let pct = v.round() as i64;
+                if !(5..=tempo::MAX_STRETCH_PERCENT as i64).contains(&pct) {
+                    return ApiResponse::error(
+                        400,
+                        &format!("max_stretch_percent must be 5 to {}", tempo::MAX_STRETCH_PERCENT),
+                    );
+                }
+                match ui.stretch_scale.borrow().as_ref() {
+                    Some(scale) => scale.set_value(pct as f64),
+                    None => player.set_max_change_percent(pct as u32),
+                }
+                changed.push("max_stretch_percent");
+            }
+            if let Some(on) = req.bool("only_faster") {
+                match ui.only_faster_switch.borrow().as_ref() {
+                    Some(sw) => sw.set_active(on),
+                    None => player.set_only_faster(on),
+                }
+                changed.push("only_faster");
+            }
+            if changed.is_empty() {
+                return ApiResponse::error(
+                    400,
+                    "send at least one of trim_silence, crossfade_secs, inner_silence_secs, \
+                     force_tempo, target_bpm, max_stretch_percent, only_faster",
+                );
+            }
+            let mut body = settings_json(player);
+            body["changed"] = json!(changed);
+            ApiResponse::ok(body)
+        }
+
+        // A track's tempo, and the speed it will therefore play at.
+        //
+        // `bpm: null` with `state: "none"` is a finding — analysed, no steady
+        // tempo — and is not the same as `state: "unknown"`, which means nobody
+        // has looked yet. An API that collapsed those into one null would make it
+        // impossible for a caller to tell "this is a podcast" from "ask again in
+        // a minute".
+        ("/api/tempo", true, _) => {
+            let index = match (req.u64("index"), req.string("path")) {
+                (Some(i), _) => Some(i as usize),
+                (None, Some(path)) => {
+                    let want = PathBuf::from(path);
+                    match ui.tracks.borrow().iter().position(|t| t.path == want) {
+                        Some(i) => Some(i),
+                        None => {
+                            return ApiResponse::error(404, "that path is not in the current queue")
+                        }
+                    }
+                }
+                (None, None) => player.current().or_else(|| ui.focus.get()),
+            };
+            let Some(index) = index else {
+                return ApiResponse::error(400, "nothing is playing — send index or path");
+            };
+            let Some(path) = ui.tracks.borrow().get(index).map(|t| t.path.clone()) else {
+                return ApiResponse::error(404, "index out of range");
+            };
+            ApiResponse::ok(tempo_json(ui, player, index, &path))
+        }
+
+        // Type a tempo over the measurement, or clear it to measure again.
+        ("/api/tempo", _, true) => {
+            let index = match (req.u64("index"), req.string("path")) {
+                (Some(i), _) => Some(i as usize),
+                (None, Some(path)) => {
+                    let want = PathBuf::from(path);
+                    match ui.tracks.borrow().iter().position(|t| t.path == want) {
+                        Some(i) => Some(i),
+                        None => {
+                            return ApiResponse::error(404, "that path is not in the current queue")
+                        }
+                    }
+                }
+                (None, None) => player.current().or_else(|| ui.focus.get()),
+            };
+            let Some(index) = index else {
+                return ApiResponse::error(400, "nothing is playing — send index or path");
+            };
+            let Some(path) = ui.tracks.borrow().get(index).map(|t| t.path.clone()) else {
+                return ApiResponse::error(404, "index out of range");
+            };
+
+            // Absent `bpm` clears it; an explicit null does too. Both mean "I
+            // don't know either, measure it again" — which is deliberately NOT
+            // the same as recording that the track has no tempo, because that
+            // finding is never revisited.
+            match req.f64("bpm") {
+                Some(v) => {
+                    if !bpm::plausible(v) {
+                        return ApiResponse::error(
+                            400,
+                            &format!("{v} is not a plausible tempo (30-300 BPM)"),
+                        );
+                    }
+                    ui.bpms.borrow_mut().set_user(&path, Some(v));
+                    ui.bpms.borrow().save();
+                    player.set_track_tempo(&path, Some(v));
+                }
+                None => {
+                    ui.bpms.borrow_mut().set_user(&path, None);
+                    ui.bpms.borrow().save();
+                    player.forget_track_tempo(&path);
+                }
+            }
+            refresh_tempo_note(ui, player);
+            ApiResponse::ok(tempo_json(ui, player, index, &path))
         }
 
         // Everything the window does, the API does — including Share. The
@@ -2401,6 +3007,12 @@ fn status_json(ui: &Rc<Ui>, player: &Arc<Player>) -> Value {
         "trim_silence": player.trim_silence(),
         "crossfade_secs": player.crossfade() as f64 / 1e9,
         "inner_silence_secs": player.inner_limit() as f64 / 1e9,
+        "force_tempo": player.force_tempo(),
+        "target_bpm": player.target_bpm(),
+        // The speed the CURRENT track is playing at, which is the one thing here
+        // a caller cannot work out for itself: it depends on that track's tempo,
+        // and on whether it was already fast enough to be left alone.
+        "speed": current.map(|i| player.speed_for_track(i)).unwrap_or(tempo::UNCHANGED),
         // What audio is really going to. `playing: true` with the position
         // advancing is NOT proof anything is audible — a sink that failed to
         // open the device looks exactly the same from the pipeline's side. This

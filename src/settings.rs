@@ -44,6 +44,17 @@ pub struct Settings {
     pub api_enabled: bool,
     /// Port for that API, on 127.0.0.1. See `api::DEFAULT_PORT`.
     pub api_port: u16,
+    /// Force Tempo: bring every track to one pace. Off by default — it changes
+    /// what the music sounds like, and a player should not start doing that on
+    /// its own.
+    pub force_tempo: bool,
+    /// The tempo to bring tracks to, in BPM.
+    pub target_bpm: u32,
+    /// The largest stretch allowed, as a percentage. See `tempo::speed_for`.
+    pub max_stretch_percent: u32,
+    /// Never play a track slower than it was recorded. On by default: the point
+    /// of the feature is a workout with no slow patches in it.
+    pub only_faster: bool,
 }
 
 impl Default for Settings {
@@ -62,6 +73,10 @@ impl Default for Settings {
             last_position_secs: 0.0,
             api_enabled: false,
             api_port: crate::api::DEFAULT_PORT,
+            force_tempo: false,
+            target_bpm: crate::tempo::DEFAULT_TARGET_BPM,
+            max_stretch_percent: crate::tempo::DEFAULT_MAX_CHANGE_PERCENT,
+            only_faster: crate::tempo::DEFAULT_ONLY_FASTER,
         }
     }
 }

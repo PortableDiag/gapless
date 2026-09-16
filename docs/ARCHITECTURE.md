@@ -139,6 +139,87 @@ bug above.
 the mixer timeline always begins at zero and the song does not. Without it the
 position display reads zero right after a seek.
 
+## Taking a branch down: finished is not the same as discarded
+
+A branch goes away for one of two reasons, and they need opposite handling.
+
+**It finished.** It reached EOS on its own. Its audio is still sitting inside the
+mixer waiting to be played, so it must be left alone and allowed to drain.
+
+**It was discarded.** A setting changed, or a new track was started, and this
+branch is being replaced. Its audio is not wanted — and, crucially, it may be
+*blocked*: a branch that has filled its queue sits inside `gst_pad_push` waiting
+for the mixer to take a buffer, and while the pipeline is PAUSED the mixer never
+will. That thread holds the pad's stream lock. `set_state(Null)` deactivates the
+pad and wants the same lock, so the caller waits forever — and the caller is the
+GTK main thread. The window stops repainting, the control API accepts connections
+it will never answer, and nothing is printed, because nothing crashed.
+
+So a discarded branch gets **FLUSH_START on its mixer pad first**. That is the
+one event designed to be sent from another thread for exactly this: it sets the
+flushing flag *without* taking the stream lock, the blocked push returns
+`FLUSHING`, and the streaming thread unwinds. No FLUSH_STOP — the pad is released
+immediately afterwards.
+
+Flushing the *finished* case instead costs 8.71 ms of silence and a 3.45 rad
+phase step at every splice. That is a click on every track change, which is the
+defect this whole player exists to remove, so the distinction is a named
+`Disposal` rather than a bool nobody can read at the call site.
+
+## Force Tempo: media time stops being wall-clock time
+
+Everything above assumes one nanosecond of track is one nanosecond of listening.
+Force Tempo breaks that, and it breaks it in three places at once.
+
+The stretch itself is easy: a `pitch` element (SoundTouch) inside the branch,
+with `tempo` set to the speed. It is **downstream of the probe**, and that
+ordering is the whole design — the probe drops and retimestamps buffers by
+comparing their PTS against trim points measured from the file, so it has to keep
+working in media time. Put the stretcher in front of it and every one of those
+comparisons is against a timebase divided by the speed. At 1.0x no element is
+inserted at all and the branch is byte-for-byte what it always was, which the
+verification checks bit-exactly rather than by length.
+
+What is *not* easy is that the mixer timeline is measured in seconds of
+**listening** while a track's length, its trim points and its resume offset are
+measured in seconds of **track**. Three numbers cross that boundary:
+
+| | |
+|---|---|
+| `Branch::span()` | what the branch occupies on the timeline, so where the follower starts. `wall_clock(len − skip, speed)`. |
+| the pad offset | `start_rt − wall_clock(head, speed)`, where `head` is the media-time trim point plus the resume skip. |
+| `Player::position()` | the inverse — `media(now − current_start, speed) + skip` — because the seek bar is in the song, not on the clock. |
+
+Get the first wrong and a crossfade starts late and is cut off by the transition.
+Get the second wrong and a resumed track misplaces its follower by the skip times
+the speed, which is [the original resume bug](../scripts/verify-resume.sh)
+reintroduced by a different route and only when the feature is on. Get the third
+wrong and the seek bar runs at the wrong rate. All three conversions go through
+one pair of functions in `src/tempo.rs` and nowhere else.
+
+**The speed is snapshotted per branch**, exactly like `trim_on`, because it is
+what the pad offset, the fade envelope and the follower's start time were all
+computed against. Changing it under a live branch would move all three, so a
+settings change instead calls `reschedule_ahead()` and rebuilds the branches that
+have not started. The track you are listening to keeps its speed — so the only
+track ever heard at the wrong speed is the one that was already playing when the
+feature was switched on.
+
+**A branch ends where its audio ends, not where its probe is.** With a stretcher
+in the chain those are different pads: the queue has seen EOS while SoundTouch is
+still holding the last fraction of a second. Retiring the branch on the upstream
+EOS tears the stretcher down before it has flushed — and before EOS reaches the
+mixer, so nothing downstream ever finalises. The symptom was a WAV file whose
+audio was perfectly correct and whose header claimed 12,173 seconds. So the EOS
+probe lives on the branch's exit pad and the buffer probe stays on the queue's,
+and at 1.0x they are the same pad, which is why nobody noticed before.
+
+**Scheduling waits for a tempo the way it already waits for a trim.** The next
+branch cannot be built until its speed is known, so `schedule_following()` defers
+if the tempo is not in yet — and `request_tempo()` always records *something*, a
+tag, a measurement, or "no steady tempo" when the decode fails, so a deferral can
+never become a stall.
+
 ## Session state
 
 `~/.config/gapless/state.json`, written **whenever a setting changes** rather than

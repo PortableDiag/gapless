@@ -28,10 +28,11 @@ use gst::prelude::*;
 use gst_controller::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::silence::{self, Trim};
+use crate::tempo;
 
 /// Everything downstream of the mixer runs at this format. Fixing it means the
 /// sink never renegotiates between tracks — a caps change mid-stream resets the
@@ -48,6 +49,11 @@ pub enum PlayerEvent {
     /// the pipeline, so nothing else would tell the UI they happened — and they
     /// can originate from MPRIS as easily as from a button.
     ModesChanged { repeat: Repeat, shuffle: Shuffle },
+    /// A tempo measurement finished. `bpm: None` means the track was analysed
+    /// and has no steady tempo. The front-end persists this — the engine's copy
+    /// dies with the process, and re-measuring a library every session would be
+    /// a decode per track for an answer that cannot change.
+    TempoMeasured { track: usize, bpm: Option<f64> },
     QueueFinished,
     Error(String),
 }
@@ -232,6 +238,13 @@ struct Branch {
     /// changing the length we already scheduled the next track against, the two
     /// tracks would overlap or leave a hole.
     trim_on: bool,
+    /// Force Tempo's playback speed for this branch, snapshotted at build time
+    /// for exactly the same reason as `trim_on`: it is what the pad offset, the
+    /// fade envelope and the follower's start time were all computed against.
+    /// Changing it under a live branch would move all three and desynchronise
+    /// the timeline, so a settings change instead rebuilds the branches that
+    /// have not started — see `reschedule_ahead`.
+    speed: f64,
     /// Whether the track that comes after this one has already been built.
     /// `schedule_following` can be reached from several places; without this it
     /// happily appends the same next track twice.
@@ -245,12 +258,18 @@ impl Branch {
     /// song's length, that says when the next track must start and where the
     /// fade-out belongs. Confusing the two schedules the follower minutes into
     /// the future: dead air, no advance, no crossfade.
+    ///
+    /// **This is wall-clock time, and `len` and `skip` are not.** The mixer
+    /// timeline is measured in seconds of listening; a track is measured in
+    /// seconds of track. At 1.3x those are different quantities, and this is the
+    /// boundary between them — a fade or a follower timed against the unscaled
+    /// number starts late and gets cut off by the transition.
     fn span(&self) -> Option<u64> {
-        self.len.map(|len| len.saturating_sub(self.skip))
+        self.len
+            .map(|len| tempo::wall_clock(len.saturating_sub(self.skip), self.speed))
     }
 }
 
-#[derive(Default)]
 struct Sched {
     branches: Vec<Branch>,
     current: Option<usize>,
@@ -263,14 +282,57 @@ struct Sched {
     /// How far into the track the current branch was told to start. The mixer
     /// timeline always begins at zero; the song does not.
     skip: u64,
+    /// The current branch's speed, so a position on the mixer timeline can be
+    /// turned back into a position in the song. Without it the seek bar runs at
+    /// the wrong rate the moment Force Tempo is on.
+    speed: f64,
     next_slot: u64,
     /// Tracks with an analysis in flight, so we never decode the same file twice.
     analyzing: HashSet<usize>,
     finished: bool,
 }
 
+/// Hand-written rather than derived because `speed` must start at 1.0. A derived
+/// `Default` gives it 0.0, and a zero speed turns every media/wall-clock
+/// conversion into a division by the `MIN_SPEED` floor — the position display
+/// would read twenty times too high before a single track had been loaded.
+impl Default for Sched {
+    fn default() -> Self {
+        Self {
+            branches: Vec::new(),
+            current: None,
+            announced: None,
+            current_start: 0,
+            current_len: 0,
+            skip: 0,
+            speed: tempo::UNCHANGED,
+            next_slot: 0,
+            analyzing: HashSet::new(),
+            finished: false,
+        }
+    }
+}
+
+/// Why a branch is going away.
+///
+/// It decides whether the branch's audio may be thrown away, and getting it
+/// wrong fails in opposite directions: flushing a branch that finished on its
+/// own puts a click in every track change, and *not* flushing one that is being
+/// replaced can deadlock the main thread. See `Player::dispose_branch`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Disposal {
+    /// It reached EOS. Its audio is still queued in the mixer and must play out.
+    Finished,
+    /// It is being replaced or abandoned, and its audio is not wanted.
+    Discarded,
+}
+
 enum Internal {
     Analyzed(usize, Trim),
+    /// A tempo measurement landed: the track, and its speed-determining BPM.
+    /// `None` means analysed and found to have no steady tempo — a real answer,
+    /// and one that must be recorded so the track is never analysed again.
+    Tempo(usize, Option<f64>),
     Eos(u64),
 }
 
@@ -295,6 +357,23 @@ pub struct Player {
     crossfade: Arc<AtomicU64>,
     /// Cap on silence left *inside* a track, in nanoseconds. Zero = leave alone.
     inner_limit: Arc<AtomicU64>,
+    /// Force Tempo: bring every track to one pace. Off by default — it changes
+    /// what the music sounds like, which is not something a player should start
+    /// doing on its own.
+    force_tempo: Arc<AtomicBool>,
+    target_bpm: Arc<AtomicU32>,
+    /// The stretch ceiling, as a percentage. See `tempo::speed_for`.
+    max_change_percent: Arc<AtomicU32>,
+    only_faster: Arc<AtomicBool>,
+    /// Resolved tempo per track. The outer `Option` is "have we looked?", the
+    /// inner one is "was there anything there?" — those are different states and
+    /// collapsing them means either re-measuring a podcast forever or inventing
+    /// a tempo for it. The authoritative store is `bpm::BpmStore` on disk; this
+    /// is the engine's copy of what it needs to schedule with.
+    tempos: Arc<Mutex<HashMap<PathBuf, Option<f64>>>>,
+    /// Tracks with a tempo measurement in flight, so one file is never decoded
+    /// for its tempo twice at once.
+    measuring: Arc<Mutex<HashSet<PathBuf>>>,
     /// Where the last session stopped: (track, offset in nanoseconds). Cued but
     /// **not** started — a player that begins blaring on login is a player you
     /// uninstall — and consumed by the first thing that asks to play.
@@ -374,6 +453,12 @@ impl Player {
             trim_enabled: Arc::new(AtomicBool::new(true)),
             crossfade: Arc::new(AtomicU64::new(0)),
             inner_limit: Arc::new(AtomicU64::new(0)),
+            force_tempo: Arc::new(AtomicBool::new(false)),
+            target_bpm: Arc::new(AtomicU32::new(tempo::DEFAULT_TARGET_BPM)),
+            max_change_percent: Arc::new(AtomicU32::new(tempo::DEFAULT_MAX_CHANGE_PERCENT)),
+            only_faster: Arc::new(AtomicBool::new(tempo::DEFAULT_ONLY_FASTER)),
+            tempos: Arc::new(Mutex::new(HashMap::new())),
+            measuring: Arc::new(Mutex::new(HashSet::new())),
             cued: Mutex::new(None),
             tx,
             itx,
@@ -554,6 +639,197 @@ impl Player {
         }
     }
 
+    // ---- force tempo -------------------------------------------------
+
+    /// Bring every track to one pace.
+    ///
+    /// Like the other playback settings this takes effect on the tracks that
+    /// have not started yet, not on the one you are listening to: its speed is
+    /// baked into a pad offset, a fade envelope and the follower's start time,
+    /// and moving it under a live branch would desynchronise all three. So the
+    /// only track ever heard at the wrong speed is the one that was already
+    /// playing when you switched it on.
+    pub fn set_force_tempo(&self, on: bool) {
+        if self.force_tempo.swap(on, Ordering::SeqCst) == on {
+            return;
+        }
+        if on {
+            // The track already playing keeps its speed, but its tempo is still
+            // worth knowing: it is what the now-playing panel shows and lets you
+            // edit, and caching it now means this track is not unmeasured again
+            // next time it comes round.
+            if let Some(track) = self.current() {
+                self.request_tempo_if_wanted(track);
+            }
+        }
+        if self.is_loaded() {
+            self.reschedule_ahead();
+        }
+    }
+
+    pub fn force_tempo(&self) -> bool {
+        self.force_tempo.load(Ordering::SeqCst)
+    }
+
+    pub fn set_target_bpm(&self, bpm: u32) {
+        let bpm = bpm.clamp(tempo::MIN_TARGET_BPM, tempo::MAX_TARGET_BPM);
+        if self.target_bpm.swap(bpm, Ordering::SeqCst) == bpm {
+            return;
+        }
+        if self.force_tempo() && self.is_loaded() {
+            self.reschedule_ahead();
+        }
+    }
+
+    pub fn target_bpm(&self) -> u32 {
+        self.target_bpm.load(Ordering::SeqCst)
+    }
+
+    pub fn set_max_change_percent(&self, percent: u32) {
+        let percent = percent.min(tempo::MAX_STRETCH_PERCENT);
+        if self.max_change_percent.swap(percent, Ordering::SeqCst) == percent {
+            return;
+        }
+        if self.force_tempo() && self.is_loaded() {
+            self.reschedule_ahead();
+        }
+    }
+
+    pub fn max_change_percent(&self) -> u32 {
+        self.max_change_percent.load(Ordering::SeqCst)
+    }
+
+    pub fn set_only_faster(&self, on: bool) {
+        if self.only_faster.swap(on, Ordering::SeqCst) == on {
+            return;
+        }
+        if self.force_tempo() && self.is_loaded() {
+            self.reschedule_ahead();
+        }
+    }
+
+    pub fn only_faster(&self) -> bool {
+        self.only_faster.load(Ordering::SeqCst)
+    }
+
+    /// Tell the engine a track's tempo. `None` records "no steady tempo", which
+    /// is why this takes an `Option` rather than treating 0 as absent.
+    ///
+    /// The front-end owns the persistent store (`bpm::BpmStore`) and pushes
+    /// what it knows in here — including a number the user typed over the
+    /// measurement, which is why this exists as a public entry point at all.
+    pub fn set_track_tempo(&self, path: &Path, bpm: Option<f64>) {
+        let changed = {
+            let mut t = self.tempos.lock().unwrap();
+            t.insert(path.to_path_buf(), bpm) != Some(bpm)
+        };
+        if changed && self.force_tempo() && self.is_loaded() {
+            self.reschedule_ahead();
+        }
+    }
+
+    pub fn track_tempo(&self, path: &Path) -> Option<Option<f64>> {
+        self.tempos.lock().unwrap().get(path).copied()
+    }
+
+    /// Forget what we know about a track's tempo, so it is measured again.
+    ///
+    /// Distinct from `set_track_tempo(path, None)`, which records "there is no
+    /// steady tempo here" — a finding that is deliberately never revisited.
+    /// This is "I don't know either, have another go".
+    pub fn forget_track_tempo(&self, path: &Path) {
+        let had = self.tempos.lock().unwrap().remove(path).is_some();
+        if had && self.force_tempo() && self.is_loaded() {
+            self.reschedule_ahead();
+        }
+    }
+
+    /// The speed a given track will play at. `1.0` whenever Force Tempo is off,
+    /// the tempo is unknown, or the track has none.
+    pub fn speed_for_track(&self, track: usize) -> f64 {
+        if !self.force_tempo() {
+            return tempo::UNCHANGED;
+        }
+        let Some(path) = self.track_path(track) else {
+            return tempo::UNCHANGED;
+        };
+        self.speed_for_path(&path)
+    }
+
+    fn speed_for_path(&self, path: &Path) -> f64 {
+        if !self.force_tempo() {
+            return tempo::UNCHANGED;
+        }
+        // Copied out and the guard dropped before anything else runs, rather than
+        // matched on in place: a temporary guard in a `match` scrutinee is held
+        // for every arm, and an arm that later grows a call back into the player
+        // would deadlock. See `schedule_following` for that bug in its live form.
+        let known = self.tempos.lock().unwrap().get(path).copied();
+        match known {
+            Some(Some(bpm)) => {
+                tempo::speed_for(bpm, self.target_bpm(), self.max_change_percent(), self.only_faster())
+            }
+            // Either not measured yet or measured and found to have none. Both
+            // play unchanged; the difference is whether we will look again.
+            _ => tempo::UNCHANGED,
+        }
+    }
+
+    fn track_path(&self, track: usize) -> Option<PathBuf> {
+        self.queue.lock().unwrap().tracks.get(track).map(|t| t.path.clone())
+    }
+
+    /// Measure a track's tempo if Force Tempo is on and we do not know it yet.
+    ///
+    /// Called for the track that is *starting*, as well as for the one being
+    /// scheduled after it. Only doing the latter looks right — the current
+    /// track's speed is already fixed and cannot change under it — and is wrong
+    /// for two reasons that only show up when you use the feature rather than
+    /// test it: the now-playing panel has nowhere to get the BPM it is supposed
+    /// to show you and edit, so it says "working out the tempo…" forever; and the
+    /// answer is never cached, so the track is still unmeasured the next time it
+    /// comes round and plays unstretched again.
+    ///
+    /// Gated on the feature being on, because it costs a decode per track and
+    /// nothing reads the answer otherwise.
+    fn request_tempo_if_wanted(&self, track: usize) {
+        if self.force_tempo() {
+            self.request_tempo(track);
+        }
+    }
+
+    /// Measure a track's tempo on a worker thread, unless it is already known or
+    /// already in flight. A failed decode records "no steady tempo" rather than
+    /// nothing: a track whose analysis errors must not be retried forever, and
+    /// must never be able to stall the scheduler waiting for an answer that will
+    /// not come.
+    fn request_tempo(&self, track: usize) {
+        let Some(path) = self.track_path(track) else { return };
+        if self.tempos.lock().unwrap().contains_key(&path) {
+            return;
+        }
+        if !self.measuring.lock().unwrap().insert(path.clone()) {
+            return;
+        }
+
+        let itx = self.itx.clone();
+        std::thread::spawn(move || {
+            // The file's own tag beats a measurement: whoever tagged it had the
+            // whole track, and usually the sleeve.
+            let found = match crate::bpm::from_tag(&path) {
+                Some(bpm) => Some(bpm),
+                None => match crate::bpm::detect(&path) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        eprintln!("tempo analysis failed for {}: {e}", path.display());
+                        None
+                    }
+                },
+            };
+            let _ = itx.send_blocking(Internal::Tempo(track, found));
+        });
+    }
+
     // ---- transport ---------------------------------------------------
 
     pub fn play_index(&self, track: usize) -> Result<()> {
@@ -601,6 +877,7 @@ impl Player {
         let trim = self.cached_trim(track);
         self.add_branch(track, 0, trim, offset)?;
         self.request_analysis(track);
+        self.request_tempo_if_wanted(track);
         // If the trims are already cached, build the follow-on track NOW, before
         // a single buffer flows. Waiting for the first-buffer callback is a race
         // the pipeline can win: with no next pad, the mixer EOSes the moment this
@@ -609,7 +886,19 @@ impl Player {
 
         // Where we actually are in the track, for the position display: the branch
         // renders from running time 0, but that instant is `offset` into the song.
-        self.sched.lock().unwrap().skip = offset;
+        // The speed goes in at the same time and for the same reason — until the
+        // position poller runs a quarter of a second from now, `position()` would
+        // otherwise convert against whatever the *previous* track was playing at.
+        // Computed before the lock is taken, not inside it: `speed_for_track`
+        // locks the queue and the tempo map, and everywhere else in this file
+        // takes those *before* `sched`. Reversing that here would be a lock-order
+        // inversion — the kind that deadlocks once, on someone else's machine.
+        let speed = self.speed_for_track(track);
+        {
+            let mut s = self.sched.lock().unwrap();
+            s.skip = offset;
+            s.speed = speed;
+        }
 
         self.pipeline.set_state(gst::State::Playing)?;
         Ok(())
@@ -754,7 +1043,9 @@ impl Player {
             .map(|t| t.nseconds())
             .unwrap_or(0);
         let s = self.sched.lock().unwrap();
-        global.saturating_sub(s.current_start) + s.skip
+        // The pipeline's position is on the clock; the seek bar is in the song.
+        // Those are the same number only at 1.0x.
+        tempo::media(global.saturating_sub(s.current_start), s.speed) + s.skip
     }
 
     // ---- branches ----------------------------------------------------
@@ -836,7 +1127,8 @@ impl Player {
             q.tracks.get(track).ok_or_else(|| anyhow!("bad index"))?.path.clone()
         };
 
-        let (bin, inner_srcpad) = build_branch(&path)?;
+        let speed = self.speed_for_path(&path);
+        let (bin, inner_srcpad, exit_pad) = build_branch(&path, speed)?;
         self.pipeline.add(&bin)?;
 
         let pad = self
@@ -850,6 +1142,12 @@ impl Player {
         // The branch's buffers are stamped from the file's start, so shift by the
         // trim point: a buffer at pts == trim.start must emerge at running time
         // start_rt. A negative offset is fine and expected.
+        //
+        // `head` is in media time — the probe that uses it runs upstream of the
+        // stretcher and compares against trim points measured in the file. The
+        // pad offset is in wall-clock time, because that is what the mixer
+        // timeline is, so the conversion happens here and nowhere else. At 1.0x
+        // the two are the same number and this reduces to what it always was.
         let trim_on = self.trim_silence();
         let inner = self.inner_limit_opt();
         let head = if trim_on {
@@ -857,7 +1155,7 @@ impl Player {
         } else {
             0
         } + skip;
-        pad.set_offset(start_rt as i64 - head as i64);
+        pad.set_offset(start_rt as i64 - tempo::wall_clock(head, speed) as i64);
 
         let cuts: Arc<Vec<(u64, u64)>> =
             Arc::new(trim.as_ref().map(|t| t.cuts(inner)).unwrap_or_default());
@@ -871,23 +1169,20 @@ impl Player {
             s.next_slot
         };
 
-        self.install_probe(
-            &inner_srcpad,
-            slot,
-            trim_cell.clone(),
-            started.clone(),
-            skip,
-            trim_on,
-            cuts,
-        );
+        self.install_probe(&inner_srcpad, trim_cell.clone(), started.clone(), skip, trim_on, cuts);
+        self.install_eos_probe(&exit_pad, slot);
 
         // The fade goes on what this branch will actually play. Resumed part-way
-        // in, that is the remainder — not the length of the song.
+        // in, that is the remainder — not the length of the song. And it is
+        // written onto the mixer timeline, so it is counted on the clock: at
+        // 1.3x the last six seconds of a track are 4.6 seconds of listening, and
+        // a fade timed against the track's own six would start late and be cut
+        // off by the transition.
         let full = trim
             .as_ref()
             .map(|t| Self::effective_len(t, trim_on, inner))
             .unwrap_or_else(|| self.track_duration(track));
-        self.apply_fade(&pad, start_rt, full.saturating_sub(skip));
+        self.apply_fade(&pad, start_rt, tempo::wall_clock(full.saturating_sub(skip), speed));
 
         self.sched.lock().unwrap().branches.push(Branch {
             slot,
@@ -900,6 +1195,7 @@ impl Player {
             trim: trim_cell,
             started,
             trim_on,
+            speed,
             followed: false,
         });
 
@@ -908,20 +1204,31 @@ impl Player {
     }
 
     /// Drops the silence, and reports the first buffer that survives.
+    /// Retire the branch when the audio has actually finished leaving it. See
+    /// `build_branch` for why this is not the pad the buffers are edited on.
+    fn install_eos_probe(&self, exit: &gst::Pad, slot: u64) {
+        let itx = self.itx.clone();
+        exit.add_probe(gst::PadProbeType::EVENT_DOWNSTREAM, move |_, info| {
+            if let Some(gst::PadProbeData::Event(event)) = &info.data {
+                if event.type_() == gst::EventType::Eos {
+                    let _ = itx.send_blocking(Internal::Eos(slot));
+                }
+            }
+            gst::PadProbeReturn::Ok
+        });
+    }
+
     fn install_probe(
         &self,
         srcpad: &gst::Pad,
-        slot: u64,
         trim: Arc<Mutex<Option<Trim>>>,
         started: Arc<AtomicBool>,
         skip: u64,
         trim_on: bool,
         cuts: Arc<Vec<(u64, u64)>>,
     ) {
-        let itx = self.itx.clone();
-
         srcpad.add_probe(
-            gst::PadProbeType::BUFFER | gst::PadProbeType::EVENT_DOWNSTREAM,
+            gst::PadProbeType::BUFFER,
             move |_, info| match &mut info.data {
                 Some(gst::PadProbeData::Buffer(buffer)) => {
                     let pts = buffer.pts().map(|p| p.nseconds()).unwrap_or(0);
@@ -978,12 +1285,6 @@ impl Player {
                     // due. What you can actually hear is derived from the playback
                     // position — see `current_at`.
                     started.store(true, Ordering::SeqCst);
-                    gst::PadProbeReturn::Ok
-                }
-                Some(gst::PadProbeData::Event(event)) => {
-                    if event.type_() == gst::EventType::Eos {
-                        let _ = itx.send_blocking(Internal::Eos(slot));
-                    }
                     gst::PadProbeReturn::Ok
                 }
                 _ => gst::PadProbeReturn::Ok,
@@ -1045,7 +1346,10 @@ impl Player {
         };
 
         for slot in doomed {
-            self.remove_branch(slot);
+            // Discarded, not finished: these branches are being replaced and
+            // their audio is not wanted. They may also be blocked pushing into a
+            // paused mixer, which is why this has to say so — see `dispose_branch`.
+            self.discard_branch(slot);
         }
         // The kept branch no longer has a successor, so let it grow one again.
         if let Some(b) = self.sched.lock().unwrap().branches.last_mut() {
@@ -1093,9 +1397,10 @@ impl Player {
     fn teardown_branches(&self) {
         let branches: Vec<Branch> = std::mem::take(&mut self.sched.lock().unwrap().branches);
         for b in branches {
-            let _ = b.bin.set_state(gst::State::Null);
-            let _ = self.pipeline.remove(&b.bin);
-            self.mixer.release_request_pad(&b.pad);
+            // Everything here is being abandoned — this runs on the way into a
+            // new track — so none of it is waiting to be heard, and any of it
+            // may be blocked pushing into a mixer that is not consuming.
+            self.dispose_branch(b, Disposal::Discarded);
         }
     }
 
@@ -1108,9 +1413,53 @@ impl Player {
                 .map(|i| s.branches.remove(i))
         };
         if let Some(b) = branch {
-            let _ = b.bin.set_state(gst::State::Null);
-            let _ = self.pipeline.remove(&b.bin);
-            self.mixer.release_request_pad(&b.pad);
+            self.dispose_branch(b, Disposal::Finished);
+        }
+    }
+
+    /// Tear one branch down.
+    ///
+    /// `Discarded` sends FLUSH_START to the mixer pad first, and that is not an
+    /// optimisation — without it the application deadlocks:
+    ///
+    /// A branch that has filled its queue sits blocked inside `gst_pad_push`,
+    /// waiting for the mixer to take a buffer. While the pipeline is PAUSED the
+    /// mixer never will. That thread holds the pad's stream lock, and
+    /// `set_state(Null)` deactivates the pad, which wants the same lock — so the
+    /// caller waits forever. The caller is the GTK main thread: the window stops
+    /// repainting and the control API accepts connections it will never answer,
+    /// with nothing printed anywhere, because nothing crashed. FLUSH_START is the
+    /// one event meant to be sent from another thread for exactly this — it sets
+    /// the flushing flag *without* taking the stream lock, so the blocked push
+    /// returns `FLUSHING` and the streaming thread unwinds. No FLUSH_STOP is
+    /// needed; the pad is released two lines later.
+    ///
+    /// **This predates Force Tempo.** Changing any playback setting twice while
+    /// paused rebuilds the branches twice and hits it; reproduced on v0.5.1 with
+    /// two crossfade changes and no tempo code in the process at all.
+    ///
+    /// `Finished` must NOT flush. A branch that reached EOS on its own still has
+    /// audio inside the mixer that has not been played yet, and flushing throws
+    /// it away: measured at 8.71 ms of silence and a 3.45 rad phase step at the
+    /// splice — a click, on every track change, which is the entire defect this
+    /// player exists to fix.
+    fn dispose_branch(&self, b: Branch, why: Disposal) {
+        if why == Disposal::Discarded {
+            b.pad.send_event(gst::event::FlushStart::new());
+        }
+        let _ = b.bin.set_state(gst::State::Null);
+        let _ = self.pipeline.remove(&b.bin);
+        self.mixer.release_request_pad(&b.pad);
+    }
+
+    /// Discard a branch that is being replaced rather than one that has ended.
+    fn discard_branch(&self, slot: u64) {
+        let branch = {
+            let mut s = self.sched.lock().unwrap();
+            s.branches.iter().position(|b| b.slot == slot).map(|i| s.branches.remove(i))
+        };
+        if let Some(b) = branch {
+            self.dispose_branch(b, Disposal::Discarded);
         }
     }
 
@@ -1139,6 +1488,37 @@ impl Player {
             return;
         };
 
+        // ...and so does its tempo, for the same reason: the speed is baked into
+        // the pad offset and the fade at build time, so a branch built before the
+        // measurement lands would play at 1.0x for its whole duration. Measuring
+        // the *next* track while the current one plays is what makes this free —
+        // there is a whole track's worth of time to do it in, and the only track
+        // ever heard at the wrong speed is the one that was already playing when
+        // the feature was switched on.
+        //
+        // This can only defer the follower, never lose it: `request_tempo`
+        // always ends by recording an answer — a tag, a measurement, or "no
+        // steady tempo" if the decode fails — and every answer comes back
+        // through `Internal::Tempo`, which calls this again.
+        if self.force_tempo() {
+            if let Some(path) = self.track_path(next) {
+                // The lock is taken into a `let` and released by the semicolon.
+                // Testing it inline — `if !self.tempos.lock().unwrap().contains_key(..)`
+                // — reads identically and deadlocks: a temporary MutexGuard in an
+                // `if` condition lives to the end of the if **body**, and the body
+                // calls `request_tempo`, which locks `tempos` again. std's Mutex
+                // is not reentrant, so the GTK main loop stops dead: the process
+                // stays alive, the window stops repainting, and the control API
+                // accepts connections it will never answer. Nothing is printed,
+                // because nothing panicked.
+                let known = self.tempos.lock().unwrap().contains_key(&path);
+                if !known {
+                    self.request_tempo(next);
+                    return;
+                }
+            }
+        }
+
         let xf = self.crossfade.load(Ordering::SeqCst).min(last_span / 2);
         let start_rt = last_start + last_span.saturating_sub(xf);
 
@@ -1154,13 +1534,13 @@ impl Player {
     /// mixer timeline. This is exact — we chose every branch's start time — and,
     /// unlike a first-buffer callback, it is not fooled by the mixer buffering a
     /// track's data long before that track is due.
-    fn current_at(&self, pos: u64) -> Option<(usize, u64, u64, u64)> {
+    fn current_at(&self, pos: u64) -> Option<(usize, u64, u64, u64, f64)> {
         let s = self.sched.lock().unwrap();
         s.branches
             .iter()
             .filter(|b| b.start_rt <= pos)
             .max_by_key(|b| b.start_rt)
-            .map(|b| (b.track, b.start_rt, b.len.unwrap_or(0), b.skip))
+            .map(|b| (b.track, b.start_rt, b.len.unwrap_or(0), b.skip, b.speed))
     }
 
     fn pump_internal(self: &Arc<Self>, irx: async_channel::Receiver<Internal>) {
@@ -1202,8 +1582,12 @@ impl Player {
                                 // The fade was written against a guess at the length
                                 // (the container's duration). Now that the real one is
                                 // known, redo it against the span this branch will
-                                // actually play.
-                                refade.push((b.pad.clone(), b.start_rt, len.saturating_sub(b.skip)));
+                                // actually play — on the clock, at this branch's speed.
+                                refade.push((
+                                    b.pad.clone(),
+                                    b.start_rt,
+                                    tempo::wall_clock(len.saturating_sub(b.skip), b.speed),
+                                ));
                                 if Some(b.track) == current {
                                     current_len = Some(len);
                                 }
@@ -1215,6 +1599,21 @@ impl Player {
                         for (pad, start_rt, span) in refade {
                             player.apply_fade(&pad, start_rt, span);
                         }
+                        player.schedule_following();
+                    }
+
+                    Internal::Tempo(track, found) => {
+                        if let Some(path) = player.track_path(track) {
+                            player.measuring.lock().unwrap().remove(&path);
+                            // Recorded whatever the answer was, including "none".
+                            // That is what stops a spoken-word track being
+                            // decoded again every time it comes round.
+                            player.tempos.lock().unwrap().insert(path.clone(), found);
+                            let _ = player
+                                .tx
+                                .send_blocking(PlayerEvent::TempoMeasured { track, bpm: found });
+                        }
+                        // The follower may have been waiting on exactly this.
                         player.schedule_following();
                     }
 
@@ -1251,7 +1650,7 @@ impl Player {
                 .map(|t| t.nseconds())
                 .unwrap_or(0);
 
-            if let Some((track, start_rt, len, skip)) = player.current_at(global) {
+            if let Some((track, start_rt, len, skip, speed)) = player.current_at(global) {
                 let changed = {
                     let mut s = player.sched.lock().unwrap();
                     let changed = s.announced != Some(track);
@@ -1262,6 +1661,10 @@ impl Player {
                     // resumed track leaves the old resume offset in place and every
                     // position after it reads that much too high.
                     s.skip = skip;
+                    // ...and its own speed, for the same reason: two tracks in one
+                    // queue can be playing at different stretches, so the position
+                    // conversion has to follow whichever one is audible.
+                    s.speed = speed;
                     s.current_len = if len > 0 { len } else { 0 };
                     changed
                 };
@@ -1272,6 +1675,7 @@ impl Player {
                 if changed {
                     let _ = player.tx.send_blocking(PlayerEvent::TrackStarted(track));
                     player.request_analysis(track);
+                    player.request_tempo_if_wanted(track);
                     player.schedule_following();
                 }
             }
@@ -1288,7 +1692,9 @@ impl Player {
     }
 }
 
-fn build_branch(path: &Path) -> Result<(gst::Bin, gst::Pad)> {
+/// One track's decode chain. `speed` is Force Tempo's stretch; at 1.0 nothing is
+/// inserted and this is byte-for-byte the pipeline it always was.
+fn build_branch(path: &Path, speed: f64) -> Result<(gst::Bin, gst::Pad, gst::Pad)> {
     let bin = gst::Bin::builder().build();
 
     let source = gst::ElementFactory::make("uridecodebin")
@@ -1326,14 +1732,68 @@ fn build_branch(path: &Path) -> Result<(gst::Bin, gst::Pad)> {
     });
 
     let srcpad = queue.static_pad("src").ok_or_else(|| anyhow!("queue has no src"))?;
-    let ghost = gst::GhostPad::with_target(&srcpad)?;
+
+    // Force Tempo's stretcher goes **downstream of the probe**, and that ordering
+    // is the whole design.
+    //
+    // The probe drops and retimestamps buffers by comparing their PTS against
+    // trim points measured from the file — numbers in media time. Put the
+    // stretcher before it and every one of those comparisons is against a
+    // timebase that has been divided by the speed, so the leading-silence cut
+    // lands in the wrong place and the interior cuts land somewhere else again.
+    // Downstream, the probe keeps working in the units it was written in and the
+    // stretcher rescales whatever survives.
+    //
+    // `pitch` (from soundtouch) rather than `scaletempo`: both preserve pitch
+    // while changing tempo, but `pitch` exposes `tempo` as a plain multiplier on
+    // a normal-rate stream, whereas `scaletempo` exists to compensate a pipeline
+    // whose *rate* has been changed by a seek — which this engine never does,
+    // because seeking is done with pad offsets.
+    let exit = if tempo::is_unchanged(speed) {
+        srcpad.clone()
+    } else {
+        let pitch = gst::ElementFactory::make("pitch")
+            .property("tempo", speed as f32)
+            .build()
+            .map_err(|_| anyhow!("no pitch element — install gstreamer1.0-plugins-bad"))?;
+        // The mixer must never see a caps change mid-stream, so the branch is
+        // pinned back to exactly the format it was already producing rather than
+        // trusting the stretcher to preserve it.
+        let after = gst::ElementFactory::make("audioconvert").build()?;
+        let pinned = gst::ElementFactory::make("capsfilter")
+            .property(
+                "caps",
+                gst::Caps::builder("audio/x-raw")
+                    .field("format", "F32LE")
+                    .field("rate", RATE)
+                    .field("channels", CHANNELS)
+                    .field("layout", "interleaved")
+                    .build(),
+            )
+            .build()?;
+        bin.add_many([&pitch, &after, &pinned])?;
+        gst::Element::link_many([&queue, &pitch, &after, &pinned])?;
+        pinned.static_pad("src").ok_or_else(|| anyhow!("capsfilter has no src"))?
+    };
+
+    let ghost = gst::GhostPad::with_target(&exit)?;
     bin.add_pad(&ghost)?;
 
-    // The real pad, not the ghost. A probe on the ghost can drop a buffer, but a
-    // buffer *modified* there does not survive the proxy hop to the mixer — the
-    // rewritten timestamps were silently discarded. Probe the queue's own src pad
-    // instead, where the edit sticks.
-    Ok((bin, srcpad.upcast()))
+    // Two pads, and they are only the same one when nothing is stretching.
+    //
+    // The first is where buffers are edited. The real pad, not the ghost: a probe
+    // on the ghost can drop a buffer, but a buffer *modified* there does not
+    // survive the proxy hop to the mixer — the rewritten timestamps were silently
+    // discarded. Probe the queue's own src pad instead, where the edit sticks.
+    //
+    // The second is where the branch actually ends, which is where "this track is
+    // over" has to be observed. With a stretcher in the chain those are different
+    // places: the queue has seen EOS while soundtouch is still holding the last
+    // fraction of a second, and retiring the branch on the upstream EOS tears the
+    // stretcher down before it has flushed — and before EOS ever reaches the
+    // mixer, so downstream never finalises. It cost a WAV file whose audio was
+    // perfectly correct and whose header claimed 12,173 seconds.
+    Ok((bin, srcpad.upcast(), exit))
 }
 
 fn watch_bus(

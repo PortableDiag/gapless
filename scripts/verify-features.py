@@ -206,11 +206,115 @@ def check_crossfade(baseline, treated, fade_s):
     return ok
 
 
+def dominant_hz(x, sr, lo=200.0, hi=1200.0):
+    """The loudest frequency in the render, measured on its middle half.
+
+    The middle half, because the head and tail of a render carry the branch
+    fade-in and fade-out, and a windowed edge has energy everywhere.
+    """
+    seg = x[len(x) // 4: len(x) * 3 // 4]
+    seg = seg - seg.mean()
+    spec = np.abs(np.fft.rfft(seg * np.hanning(len(seg))))
+    freqs = np.fft.rfftfreq(len(seg), 1.0 / sr)
+    band = (freqs >= lo) & (freqs <= hi)
+    return float(freqs[band][np.argmax(spec[band])])
+
+
+def check_tempo(baseline, treated, speed):
+    """Force Tempo: the render gets shorter and the PITCH DOES NOT MOVE.
+
+    Duration alone proves nothing here, and this is the whole trap in the
+    feature. Simply resampling the audio — playing it at the wrong rate, the way
+    a tape deck does — shortens a render by *exactly* the same ratio and is
+    trivial to implement by accident. It also transposes the music up by that
+    ratio, which is the one thing the feature promises not to do.
+
+    So the check is a pair: the length must move by the ratio and the dominant
+    frequency must NOT. At 1.25x a 440 Hz fixture stays at 440 Hz if it was
+    time-stretched and lands at 550 Hz if it was resampled, and 550 is nowhere
+    near 440 — this separates the two with enormous margin rather than by a
+    hair.
+    """
+    b, sr = load(baseline)
+    t, _ = load(treated)
+
+    b_dur, t_dur = len(b) / sr, len(t) / sr
+    want = b_dur / speed
+    # The timeline is computed in whole nanoseconds from an integer sample count,
+    # so this is exact up to rounding, not approximate. 5 ms is generous.
+    dur_ok = abs(t_dur - want) < 0.005
+
+    b_hz, t_hz = dominant_hz(b, sr), dominant_hz(t, sr)
+    # A resample would land at b_hz * speed. Require the answer to be far nearer
+    # the un-transposed pitch than the transposed one.
+    resampled_hz = b_hz * speed
+    pitch_ok = abs(t_hz - b_hz) < abs(t_hz - resampled_hz) and abs(t_hz - b_hz) / b_hz < 0.02
+
+    # The baseline must NOT already be at the treated length, or the fixture
+    # would be proving nothing — the same argument as every other mode here.
+    control_ok = abs(b_dur - want) > 0.05
+
+    gap = interior_gap_ms(t, sr)
+    gap_ok = gap < 20.0
+
+    ok = report(f"force tempo {speed:.2f}x",
+                dur_ok and pitch_ok and control_ok and gap_ok,
+                f"{b_dur:.3f} s -> {t_dur:.3f} s, pitch {b_hz:.0f} Hz -> {t_hz:.0f} Hz")
+    if not dur_ok:
+        print(f"    - expected {want:.3f} s at {speed:.2f}x, got {t_dur:.3f} s "
+              f"— the mixer timeline is not being scaled by the playback speed")
+    if not pitch_ok:
+        print(f"    - pitch moved {b_hz:.0f} -> {t_hz:.0f} Hz; a resample would "
+              f"land at {resampled_hz:.0f} Hz. The stretch must preserve pitch, "
+              f"which is the entire difference between this and playing the file fast")
+    if not control_ok:
+        print(f"    - the BASELINE render is already {b_dur:.3f} s, which is the "
+              f"treated length — the fixture cannot show the defect")
+    if not gap_ok:
+        print(f"    - {gap:.0f} ms of silence inside the stretched render — the "
+              f"splice between branches is no longer gapless at this speed")
+    return ok
+
+
+def check_tempo_untouched(baseline, treated):
+    """The other half of Force Tempo: a track fast enough is left ALONE.
+
+    "Never slow a track down" is the default and the reason the feature exists —
+    a workout with no slow patches in it. A player that stretched everything
+    unconditionally to hit the number would pass every duration check in this
+    file while getting the feature exactly backwards, so the refusal needs a
+    check of its own: same fixtures, a tempo above the target, and the render
+    must come out sample-identical to the untouched baseline.
+    """
+    b, sr = load(baseline)
+    t, _ = load(treated)
+
+    same_len = len(b) == len(t)
+    # Sample-identical, not merely the same length: a stretch to 1.0x that still
+    # routed the audio through the stretcher would round-trip through overlap-add
+    # and come back subtly different.
+    identical = same_len and bool(np.array_equal(b, t))
+
+    detail = f"{len(b) / sr:.3f} s -> {len(t) / sr:.3f} s"
+    ok = report("force tempo, fast track", identical, detail + ", untouched")
+    if not same_len:
+        print(f"    - a track already above the target was stretched anyway: "
+              f"{len(b)} frames became {len(t)}. With 'never slow a track down' "
+              f"set, it must be left completely alone")
+    elif not identical:
+        print("    - the length is right but the samples differ — the audio is "
+              "being routed through the stretcher at 1.0x instead of bypassing "
+              "it, which costs CPU and is not bit-exact")
+    return ok
+
+
 def main():
     args = sys.argv[1:]
     usage = ("usage: verify-features.py trim      BASELINE.wav TRIMMED.wav\n"
              "       verify-features.py inner     BASELINE.wav CAPPED.wav CAP_SECONDS\n"
-             "       verify-features.py crossfade BASELINE.wav FADED.wav  FADE_SECONDS")
+             "       verify-features.py crossfade BASELINE.wav FADED.wav  FADE_SECONDS\n"
+             "       verify-features.py tempo     BASELINE.wav FORCED.wav SPEED\n"
+             "       verify-features.py tempo-untouched BASELINE.wav FORCED.wav")
     if not args:
         sys.exit(usage)
 
@@ -221,6 +325,10 @@ def main():
         ok = check_inner(args[1], args[2], float(args[3]))
     elif mode == "crossfade" and len(args) == 4:
         ok = check_crossfade(args[1], args[2], float(args[3]))
+    elif mode == "tempo" and len(args) == 4:
+        ok = check_tempo(args[1], args[2], float(args[3]))
+    elif mode == "tempo-untouched" and len(args) == 3:
+        ok = check_tempo_untouched(args[1], args[2])
     else:
         sys.exit(usage)
 

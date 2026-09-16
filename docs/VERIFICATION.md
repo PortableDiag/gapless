@@ -164,7 +164,7 @@ library that is not in the repo and cannot be re-measured by anyone reading this
 A number nobody can reproduce is an assertion with a decimal point on it, which
 is the thing this document exists to avoid.
 
-## The three features
+## The playback features
 
 These are not "is the splice gapless", and each regresses on its own, so
 `scripts/verify-features.py` measures them separately. Every one is rendered
@@ -197,6 +197,45 @@ Fixtures come from `scripts/make-test-tones.sh`. `testdata/` is gitignored, so
 everything the checks touch has to be reproducible from that script — it wasn't
 before, and `verify-resume.sh` had been guarding itself with a call to a script
 that did not build the file it was looking for.
+
+## Force Tempo
+
+Two checks in `verify.sh`, and they are a pair on purpose.
+
+**The stretch.** Both fixtures are declared 100 BPM against a 125 BPM target, so
+the expected speed is exactly 1.25x and the arithmetic in the expected length is
+visible rather than derived from whatever the estimator happened to say. A
+20.000 s render must come back as 16.000 s — and it does, to the sample.
+
+The tempos are **stated, not measured**, because this check is about the stretch
+and the timeline. Whether the estimator agrees with a fixture is a different
+question with its own tests in `src/bpm.rs`, and tangling them would mean a
+detector regression failing a timeline check and sending you to the wrong file.
+
+**And the pitch must not move**, which is the check that actually matters.
+Duration alone proves nothing here: simply *resampling* the audio — playing it at
+the wrong rate, the way a tape deck does — shortens a render by exactly the same
+ratio, is trivial to implement by accident, and transposes the music up by that
+ratio, which is the one thing the feature promises not to do. So the dominant
+frequency is measured before and after: 440 Hz must stay 440 Hz. A resample lands
+at 550, so the two are separated by enormous margin rather than by a hair. That
+negative control has been run: a deliberately resampled render is caught.
+
+**The refusal.** "Never slow a track down" is the default and the reason the
+feature exists, so a second check renders the same fixtures at 200 BPM against a
+125 BPM target and requires the output to be **bit-identical** to the untouched
+baseline — not merely the same length, which would also pass if the audio were
+routed through the stretcher at 1.0x and quietly round-tripped through
+overlap-add. Without this check, an implementation that stretched everything
+unconditionally would pass every other measurement in the file.
+
+**Composition.** `verify-resume.sh` covers the part that is easy to get wrong
+without noticing: a track resumed part-way in *and* stretched. The skip is
+measured in the track and the pad offset it becomes is measured on the clock, so
+a missing conversion misplaces the follower by the skip times the speed. Its
+control renders the same seek with tempos above the target, where nothing is
+stretched and the answer must be the unstretched 15.000 s — otherwise a
+implementation that ignored the speed entirely would still pass.
 
 ## Testing against real speakers
 

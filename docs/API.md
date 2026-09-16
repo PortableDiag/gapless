@@ -101,7 +101,9 @@ the key needs nothing else to get started.
 | `POST /api/rating` | `{index\|path, stars}` |
 | `POST /api/open` | `{path}` — a folder or a playlist |
 | `GET /api/settings` | playback settings |
-| `POST /api/settings` | `{trim_silence?, crossfade_secs?, inner_silence_secs?}` |
+| `POST /api/settings` | `{trim_silence?, crossfade_secs?, inner_silence_secs?, force_tempo?, target_bpm?, max_stretch_percent?, only_faster?}` |
+| `GET /api/tempo` | `{index\|path}` — a track's BPM and the speed it will play at |
+| `POST /api/tempo` | `{index\|path, bpm?}` — type a tempo over the measurement |
 | `POST /api/share` | `{index\|path, mode?, dest?}` — everything the Share button does |
 | `POST /api/listen` | `{port}` — move the API to another port, for a handover |
 | `GET /api/autostart` | whether Gapless starts at login |
@@ -255,11 +257,12 @@ already in favorites mode leaves it in favorites rather than demoting it.
 
 ## Playback settings
 
-The three things behind the gear button.
+Everything behind the gear button.
 
 ```sh
 curl -s -H "Authorization: Bearer $KEY" "$BASE/api/settings"
-# -> {"ok":true,"trim_silence":true,"crossfade_secs":0.0,"inner_silence_secs":0.0}
+# -> {"ok":true,"trim_silence":true,"crossfade_secs":0.0,"inner_silence_secs":0.0,
+#     "force_tempo":false,"target_bpm":140,"max_stretch_percent":30,"only_faster":true}
 
 curl -s -X POST -H "Authorization: Bearer $KEY" \
      -d '{"crossfade_secs":3.0,"trim_silence":false}' "$BASE/api/settings"
@@ -271,9 +274,71 @@ curl -s -X POST -H "Authorization: Bearer $KEY" \
   the crossfade collapses to exact concatenation.
 - `inner_silence_secs` — 0 to 10; caps silence left *inside* a track. 0 leaves
   tracks alone.
+- `force_tempo` — play every track at one pace. See **Force Tempo** below.
+- `target_bpm` — 60 to 200. The tempo to bring tracks to.
+- `max_stretch_percent` — 5 to 50. The ceiling on how far a track may be
+  stretched.
+- `only_faster` — never play a track slower than it was recorded. On by default.
 
 Out of range is a 400 and changes nothing. Send at least one field or you get a
 400 saying so, rather than a successful call that did nothing.
+
+**These take effect on the tracks that have not started yet**, not on the one you
+are listening to. A track's speed is baked into its pad offset, its fade envelope
+and the start time of the track after it; moving it under a live branch would
+desynchronise all three.
+
+---
+
+## Force Tempo
+
+Set a BPM and every track plays at it — a **pitch-preserving** stretch, so a
+128 BPM track at 1.09x is still in the key it was recorded in.
+
+```sh
+# Switch it on and pick a pace.
+curl -s -X POST -H "Authorization: Bearer $KEY" \
+     -d '{"force_tempo":true,"target_bpm":140}' "$BASE/api/settings"
+
+# What is the playing track doing?
+curl -s -H "Authorization: Bearer $KEY" "$BASE/api/tempo"
+# -> {"ok":true,"index":27,"state":"known","bpm":128.0,"source":"measured",
+#     "speed":1.09375,"speed_text":"1.09x","effective_bpm":140.0}
+```
+
+`state` has **three** values and they are not interchangeable:
+
+| `state` | `bpm` | meaning |
+|---|---|---|
+| `unknown` | `null` | nobody has looked at this track yet — ask again shortly |
+| `none` | `null` | analysed, and there is **no steady tempo** in it. Played unchanged, and never analysed again |
+| `known` | a number | the tempo, with `source` saying where it came from |
+
+Collapsing `unknown` and `none` into one null would make it impossible to tell
+"this is a podcast" from "ask again in a minute", so they stay separate all the
+way out to here.
+
+`source` is `tag` (the file's own `TBPM`), `measured`, or `user`.
+
+**The measurement is editable**, because it is a measurement rather than a
+preference and you can hear when it is wrong:
+
+```sh
+# Type a tempo over it. A user-supplied number WINS and is never re-measured.
+curl -s -X POST -H "Authorization: Bearer $KEY" \
+     -d '{"index":27,"bpm":85}' "$BASE/api/tempo"
+
+# Omit bpm to throw the number away and measure again. This is NOT the same as
+# recording that the track has no tempo — that finding is never revisited.
+curl -s -X POST -H "Authorization: Bearer $KEY" -d '{"index":27}' "$BASE/api/tempo"
+```
+
+A tempo outside 30–300 BPM is a 400, not a clamp.
+
+`GET /api/status` also carries `force_tempo`, `target_bpm` and `speed` — the last
+being the speed the **current** track is playing at, which is the one thing a
+caller cannot work out for itself, because it depends on that track's own tempo
+and on whether it was already fast enough to be left alone.
 
 ---
 

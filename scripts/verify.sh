@@ -63,3 +63,24 @@ cargo run --release --quiet --example capture -- \
 GAPLESS_CROSSFADE=3 cargo run --release --quiet --example capture -- \
   "$OUT/xf-on.wav" testdata/xf-440.mp3 testdata/xf-880.mp3
 python3 scripts/verify-features.py crossfade "$OUT/xf-off.wav" "$OUT/xf-on.wav" 3
+
+# Force Tempo. The tempos are STATED here rather than measured, because this
+# check is about the stretch and the timeline — whether the estimator agrees
+# with a fixture is a separate question, answered by the unit tests in
+# src/bpm.rs. Tagging both halves 100 BPM against a 125 BPM target asks for
+# exactly 1.25x, so the arithmetic in the expected length is visible rather
+# than derived from whatever the detector happened to say.
+cargo run --release --quiet --example capture -- \
+  "$OUT/tempo-off.wav" testdata/flac-part1.flac testdata/flac-part2.flac
+GAPLESS_TARGET_BPM=125 GAPLESS_BPM=100,100 cargo run --release --quiet --example capture -- \
+  "$OUT/tempo-on.wav" testdata/flac-part1.flac testdata/flac-part2.flac
+python3 scripts/verify-features.py tempo "$OUT/tempo-off.wav" "$OUT/tempo-on.wav" 1.25
+
+# ...and the half of the feature that is a REFUSAL. A track already at or above
+# the target must be left completely alone, so this renders the same fixtures at
+# 200 BPM against a 125 BPM target and requires the output to be identical in
+# length to the untouched baseline. Without this, a Force Tempo that simply
+# stretched everything unconditionally would pass every check above.
+GAPLESS_TARGET_BPM=125 GAPLESS_BPM=200,200 cargo run --release --quiet --example capture -- \
+  "$OUT/tempo-fast.wav" testdata/flac-part1.flac testdata/flac-part2.flac
+python3 scripts/verify-features.py tempo-untouched "$OUT/tempo-off.wav" "$OUT/tempo-fast.wav"

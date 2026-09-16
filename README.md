@@ -42,6 +42,11 @@ both, and can crossfade instead if you'd rather.
 - **Cap silence inside a track** — for long pauses and hidden tracks buried in
   dead air. A cap, not a switch: a four-bar rest is music.
 - **Crossfade, 0–10 s** — Winamp-style, equal-power.
+- **Force tempo** — set a BPM and every track plays at it, **pitch-preserving**,
+  so a 128 BPM track at 1.09x is still in the key it was recorded in. A tempo
+  comes from the file's `TBPM` tag or is measured from the audio, and is
+  remembered. A track with **no** steady tempo is found to have none and left
+  alone; a track already fast enough is left alone too.
 - **Star ratings, 1–5** — on the now-playing panel, on the number keys, or from
   a right-click on any row. Kept in a sidecar file, **not** written into your
   audio files.
@@ -83,7 +88,86 @@ cargo run --release
 
 Then **Open Folder…** or **Open Playlist…**, and press play.
 
-The three playback settings live behind the **gear button** in the header bar.
+The playback settings live behind the **gear button** in the header bar.
+
+### Force tempo
+
+**Set a BPM and everything plays at it.** Switch it on under **Force tempo**
+behind the gear button, pick a target from 60 to 200, and each track is sped up
+as far as it needs to reach it.
+
+It exists for one complaint: a workout playlist where **one slow track is a slow
+patch in the workout**. Everything about the defaults follows from that.
+
+| Control | Default | What it does |
+|---|---|---|
+| **Target tempo** | 140 BPM | The tempo to bring every track to. |
+| **Most a track may be stretched** | 30% | The ceiling. Under about 30% a stretched track just sounds like a track at that tempo; well over it, it sounds stretched. A track that cannot reach the target inside the ceiling goes as far as the ceiling allows rather than further. |
+| **Never slow a track down** | on | A track already at or above the target is left **completely alone** — verified bit-exact, not just the same length. Off, a fast track is slowed to meet the target too. |
+
+The stretch is GStreamer's `pitch` element (SoundTouch), so **the pitch does not
+move**: a 128 BPM track at 1.09x is still in the key it was recorded in. The
+verification renders a 440 Hz fixture at 1.25x and requires it to come back at
+440 Hz — a naive resample lands at 550 Hz and is caught.
+
+**Where a tempo comes from.** The file's **`TBPM` tag** if it has a believable
+one; otherwise Gapless **measures** it — half a minute decoded from 30 s in (the
+opening of a track is the least representative part of it), reduced to an onset
+envelope at 10 ms resolution and autocorrelated. Either way the answer is
+**remembered per track** in `~/.config/gapless/bpm.json`, so it is worked out
+once and never again, and the **next** track in the queue is analysed while the
+current one plays — so the only track ever heard at the wrong speed is the one
+that was already playing when you switched the feature on.
+
+**A track with no tempo is never touched.** An audiobook, a drone or a field
+recording is analysed, found to have no steady beat, and **written down as having
+none** — it plays unchanged and is not analysed again. "Nothing known yet" and
+"nothing there" are deliberately two different states, all the way out to the
+API: a player that invented a tempo for a podcast and then played it 30% fast
+would be indefensible.
+
+**The measured number is editable**, because it is a measurement rather than a
+preference and you can hear when it is wrong. The panel shows the playing track's
+BPM in a field you can type over; a number you supply **wins and is never quietly
+re-measured**, and clearing it throws the measurement away and has another go.
+
+#### Octaves, which is where this gets interesting
+
+A tempo is only defined up to a factor of two — a track counted at 70 BPM and a
+track counted at 140 can be the same felt pace. That ambiguity is handled in
+**two** places, and it has to be.
+
+- **Choosing the speed.** 70 BPM in double time *is* 140, so such a track is left
+  alone rather than played at 2.0x. But the fold is only accepted when the halved
+  or doubled reading lands **near** the target (within 15%, measured in log space
+  so it means the same thing in both directions), so a merely slow **95 BPM**
+  track is not excused as a secretly-fast one on the grounds that 190 is "closer"
+  to 140 in ratio — it gets stretched, which is the point.
+- **Measuring it.** The estimator resolves its own octave with a preference
+  weight around the perceived pulse, plus a tie-break that takes the **faster**
+  reading when the audio supports both equally: a rhythm that repeats every beat
+  also repeats every two, so the slower lag always correlates at least as well
+  and picking the maximum would systematically halve every tempo. The converse
+  does not hold — if the beat really were the slower one, the half-lag would be
+  lining beats up with the gaps and correlating badly.
+
+The lag search runs at **quarter-frame** resolution rather than whole frames, and
+that is not a precision nicety — it is the difference between a right answer and
+an octave. A 160 BPM beat lands every 37.5 envelope frames, so *neither* lag 37
+nor lag 38 lines the rhythm up with itself, while lag 75 — two beats — lines it
+up perfectly. A whole-frame search reports 80 BPM for that track, confidently.
+(The envelope is also blurred before it is interpolated, without which the
+quarter-frame grid is a fiction and the same octave error comes back by a
+different route.)
+
+**What it composes with.** Force Tempo is the first thing here that makes **media
+time and wall-clock time different quantities**. The mixer timeline is measured
+in seconds of listening; a track is measured in seconds of track. At 1.3x the
+last six seconds of a track are 4.6 seconds of listening, so a crossfade timed
+against the wrong one starts late and is cut off by the transition, and a track
+resumed part-way in would place its follower wrong by the skip times the speed.
+Every conversion goes through one pair of functions in `src/tempo.rs`, and both
+compositions are checked by `verify-resume.sh`.
 
 ## Verify the claims yourself
 
@@ -105,6 +189,8 @@ negative controls       7/7 broken splices caught
 silence trim            1000 ms gap  ->  10 ms
 interior silence cap    3000 ms pause -> 1010 ms at a 1.0 s cap
 crossfade 3 s           20.0 s -> 17.0 s, equal-power to 0.13%
+force tempo 1.25x       20.000 s -> 16.000 s, pitch 440 Hz -> 440 Hz
+force tempo, fast track 20.000 s -> 20.000 s, untouched
 ```
 
 Every line there is produced by the run — nothing in that block is quoted from a
@@ -130,13 +216,14 @@ for you if `testdata/` is missing or incomplete.
 See **[docs/VERIFICATION.md](docs/VERIFICATION.md)** for how and why, including
 why the obvious way to test this is wrong.
 
-Four more checks, each written after a real bug got past the ones above:
+Four more scripts, each written after a real bug got past the ones above:
 
 ```sh
-./scripts/verify-resume.sh                  # a track resumed part-way in must still hand off
+./scripts/verify-resume.sh                  # a track resumed part-way in must still hand off,
+                                            # at 1.0x and stretched
 DISPLAY=:0 ./scripts/verify-mpris-modes.sh  # a mode set over D-Bus must survive a SIGKILL, must
                                             # not downgrade favorites shuffle, and Play must resume
-DISPLAY=:0 ./scripts/verify-api.sh          # 51 checks over a real socket against the real app
+DISPLAY=:0 ./scripts/verify-api.sh          # 78 checks over a real socket against the real app
 DISPLAY=:0 GAPLESS_INPUT_OK=1 \
   ./scripts/verify-input.sh      # the rating keys and the right-click menu, real input
 ```
@@ -204,6 +291,10 @@ Playback is solid. Not yet done: no database (the library is rescanned on each
 open, and ratings are a flat JSON sidecar rather than a table), no search, no
 queue editing, no folder.jpg cover fallback, and no import of ratings already
 sitting in your files' `POPM` frames.
+
+Force Tempo has one sibling in Lull that is **not** here: *push through quiet
+parts*, which speeds up further inside a dead spot. Gapless answers that case
+differently already, with the interior-silence cap.
 
 Note that **Next is a hard cut, deliberately** — it tears the mixer timeline down
 and starts the new track at once. Crossfade applies to the track that follows

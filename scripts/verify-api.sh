@@ -256,6 +256,71 @@ check "out of range is rejected" 400 \
 check "and did not take effect"  3.0 "$(api "$BASE/api/settings" | field crossfade_secs)"
 
 echo
+echo "=== force tempo ==="
+check "off by default"          False "$(api "$BASE/api/settings" | field force_tempo)"
+check "and defaults to 140 BPM" 140   "$(api "$BASE/api/settings" | field target_bpm)"
+api -X POST -d '{"force_tempo":true,"target_bpm":150}' "$BASE/api/settings" >/dev/null
+check "switched on"             True  "$(api "$BASE/api/settings" | field force_tempo)"
+check "target set"              150   "$(api "$BASE/api/settings" | field target_bpm)"
+check "and status agrees"       150   "$(api "$BASE/api/status" | field target_bpm)"
+check "a target below 60 is rejected"  400 \
+      "$(code -X POST -H "Authorization: Bearer $KEY" -d '{"target_bpm":30}' "$BASE/api/settings")"
+check "a target above 200 is rejected" 400 \
+      "$(code -X POST -H "Authorization: Bearer $KEY" -d '{"target_bpm":400}' "$BASE/api/settings")"
+check "and neither took effect"  150 "$(api "$BASE/api/settings" | field target_bpm)"
+check "an absurd stretch is rejected"  400 \
+      "$(code -X POST -H "Authorization: Bearer $KEY" -d '{"max_stretch_percent":500}' "$BASE/api/settings")"
+
+# The three states are the part of this feature most likely to be quietly wrong,
+# because "unknown" and "none" both carry a null bpm and collapsing them looks
+# harmless until a podcast is re-analysed on every pass.
+TEMPO=$(api "$BASE/api/tempo?index=0")
+STATE=$(printf '%s' "$TEMPO" | field state)
+check "a track's tempo has a state" yes \
+      "$(python3 -c "print('yes' if '$STATE' in ('known','none','unknown') else 'no ($STATE)')")"
+
+# Type a tempo over it and the speed must follow arithmetically: 100 BPM against
+# a 150 target is 1.5x, which the 30% ceiling clamps to 1.30.
+api -X POST -d '{"index":0,"bpm":100}' "$BASE/api/tempo" >/dev/null
+TYPED=$(api "$BASE/api/tempo?index=0")
+check "a typed tempo is recorded"  known "$(printf '%s' "$TYPED" | field state)"
+check "and is marked as the user's" user "$(printf '%s' "$TYPED" | field source)"
+check "and it is the number typed"  100.0 "$(printf '%s' "$TYPED" | field bpm)"
+check "the speed is clamped to the ceiling" 1.3 \
+      "$(printf '%s' "$TYPED" | python3 -c 'import json,sys;print(round(json.load(sys.stdin)["speed"],4))')"
+check "and that speed is in the sidecar file" 100.0 \
+      "$(python3 -c "
+import json
+d = json.load(open('$CFG/gapless/bpm.json'))['tracks']
+print(next(v['bpm'] for v in d.values() if v.get('source') == 'user'))")"
+
+# A tempo outside any musical range is a refusal, not a clamp — the same rule as
+# every other numeric field here.
+check "an implausible tempo is refused" 400 \
+      "$(code -X POST -H "Authorization: Bearer $KEY" -d '{"index":0,"bpm":6000}' "$BASE/api/tempo")"
+check "and the typed one survived"  100.0 "$(api "$BASE/api/tempo?index=0" | field bpm)"
+
+# Clearing means "measure it again", NOT "this track has no tempo". Those are
+# different states and landing in the wrong one means never looking again.
+api -X POST -d '{"index":0}' "$BASE/api/tempo" >/dev/null
+CLEARED=$(api "$BASE/api/tempo?index=0" | field state)
+check "clearing restores it to unmeasured" yes \
+      "$(python3 -c "print('yes' if '$CLEARED' != 'none' else 'no - it was recorded as having NO tempo')")"
+
+# A fast track is left alone. This is the half of the feature that is a refusal,
+# and an implementation that stretched everything would pass every check above.
+api -X POST -d '{"index":0,"bpm":200}' "$BASE/api/tempo" >/dev/null
+check "a track above the target is untouched" 1.0 \
+      "$(api "$BASE/api/tempo?index=0" \
+         | python3 -c 'import json,sys;print(round(json.load(sys.stdin)["speed"],4))')"
+api -X POST -d '{"only_faster":false}' "$BASE/api/settings" >/dev/null
+check "unless you say it may slow tracks down" yes \
+      "$(api "$BASE/api/tempo?index=0" \
+         | python3 -c 'import json,sys;print("yes" if json.load(sys.stdin)["speed"] < 1.0 else "no")')"
+api -X POST -d '{"only_faster":true,"force_tempo":false}' "$BASE/api/settings" >/dev/null
+check "and it can be switched back off" False "$(api "$BASE/api/settings" | field force_tempo)"
+
+echo
 echo "=== the listener can be moved, and moved onto itself ==="
 # Rebinding to the SAME port is what the Regenerate-key button does. Before the
 # accept thread was joined on drop, the old socket was still open when the new

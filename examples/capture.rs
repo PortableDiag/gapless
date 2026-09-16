@@ -68,6 +68,38 @@ fn main() -> Result<()> {
         eprintln!("  (crossfade {secs:.1}s)");
     }
 
+    // Force Tempo. GAPLESS_BPM lets a check state each track's tempo outright
+    // rather than relying on the estimator — the two halves of the feature are
+    // separable and a render that measures the *stretch* should not fail because
+    // the *detector* disagreed about a fixture. Comma-separated, one per track;
+    // an empty entry means "no steady tempo".
+    if let Some(target) = std::env::var("GAPLESS_TARGET_BPM").ok().and_then(|v| v.parse::<u32>().ok())
+    {
+        if let Ok(list) = std::env::var("GAPLESS_BPM") {
+            for (i, field) in list.split(',').enumerate() {
+                let Some(path) = tracks.get(i) else { break };
+                player.set_track_tempo(path, field.trim().parse::<f64>().ok());
+            }
+        }
+        if let Some(pct) =
+            std::env::var("GAPLESS_MAX_STRETCH").ok().and_then(|v| v.parse::<u32>().ok())
+        {
+            player.set_max_change_percent(pct);
+        }
+        player.set_only_faster(std::env::var("GAPLESS_ALLOW_SLOWER").is_err());
+        player.set_target_bpm(target);
+        player.set_force_tempo(true);
+        eprintln!(
+            "  (force tempo {target} BPM, ceiling {}%, only-faster {})",
+            player.max_change_percent(),
+            player.only_faster()
+        );
+        for (i, path) in tracks.iter().enumerate() {
+            eprintln!("     track {i}: {}", gapless::tempo::format_speed(player.speed_for_track(i)));
+            let _ = path;
+        }
+    }
+
 
     let main_loop = glib::MainLoop::new(None, false);
     let events = player.events.clone();

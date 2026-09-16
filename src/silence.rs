@@ -54,7 +54,7 @@ impl Trim {
 /// Silence shorter than this inside a track is a musical rest, not a gap.
 const MIN_HOLE_NS: u64 = 400_000_000;
 
-const RATE: u64 = 8000;
+pub const RATE: u64 = 8000;
 /// Silence is judged against the track's OWN peak, not an absolute level. A fixed
 /// threshold gets this wrong in both directions: too low and the noise floor a
 /// lossy codec decodes into a "silent" run-out reads as music (measured: a 991 ms
@@ -70,7 +70,14 @@ const FLOOR: f64 = 0.001;
 /// Keep a little air either side so we never clip an attack or a decay tail.
 const GUARD_NS: u64 = 10_000_000;
 
-pub fn analyze(path: &Path) -> Result<Trim> {
+/// Decodes a file to 8 kHz mono, as signed samples in −1.0..=1.0.
+///
+/// Shared by the silence analysis and the tempo estimator, which want the same
+/// cheap decode for different reasons — one needs an amplitude edge, the other
+/// an onset envelope, and 8 kHz is ample for both at about 20x less work than
+/// decoding at full rate. Extracted so there is exactly one copy of the
+/// `uridecodebin` + `appsink` plumbing to get wrong.
+pub fn decode_mono_8k(path: &Path) -> Result<Vec<f32>> {
     let uri = crate::player::uri_for(path);
 
     let source = gst::ElementFactory::make("uridecodebin")
@@ -112,19 +119,24 @@ pub fn analyze(path: &Path) -> Result<Trim> {
 
     pipeline.set_state(gst::State::Playing)?;
 
-    // Two passes over an 8 kHz mono decode: a few MB even for a long track, and
-    // we need the peak before we can say what counts as silence.
-    let mut envelope: Vec<f64> = Vec::new();
+    let mut samples: Vec<f32> = Vec::new();
     while let Ok(sample) = appsink.pull_sample() {
         let Some(buffer) = sample.buffer() else { continue };
         let Ok(map) = buffer.map_readable() else { continue };
         for chunk in map.chunks_exact(2) {
             let v = i16::from_le_bytes([chunk[0], chunk[1]]);
-            envelope.push((v as f64 / 32768.0).abs());
+            samples.push(v as f32 / 32768.0);
         }
     }
 
     let _ = pipeline.set_state(gst::State::Null);
+    Ok(samples)
+}
+
+pub fn analyze(path: &Path) -> Result<Trim> {
+    // Two passes over an 8 kHz mono decode: a few MB even for a long track, and
+    // we need the peak before we can say what counts as silence.
+    let envelope: Vec<f64> = decode_mono_8k(path)?.iter().map(|v| v.abs() as f64).collect();
 
     let to_ns = |s: usize| (s as u64) * 1_000_000_000 / RATE;
     let total = to_ns(envelope.len());
