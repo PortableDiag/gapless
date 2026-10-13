@@ -5,6 +5,26 @@ All notable changes to Gapless. Newest first.
 The project is pre-1.0; entries are grouped by release and carry the commit
 that made them.
 
+## v0.6.1 — 2026-10-13
+
+### Fixed
+
+- **Opening a song from the file manager now plays it.** Double-clicking a track
+  (or *Open with Gapless*) brought the window up on last session's queue and
+  never mentioned the song that was clicked. Two halves: the app did not declare
+  `HANDLES_OPEN`, so GApplication refused file arguments outright, and the
+  desktop entry's `Exec=gapless` had no `%F`, so no file was passed anyway.
+
+  The clicked song now plays at once, with the songs beside it in its folder
+  queued after it (that folder only, not everything under it — a song saved to
+  `~` would otherwise scan the whole home). A song already in the queue just
+  plays, without rebuilding it. A playlist or folder opened the same way loads
+  and plays from the top. Works on a cold start and against a copy already
+  running. `POST /api/open` accepts a song too, with the same meaning.
+
+- **A second launch no longer builds a second window and audio engine.** It
+  raises the one that is there.
+
 ## v0.6.0 — 2026-09-16
 
 ### Added

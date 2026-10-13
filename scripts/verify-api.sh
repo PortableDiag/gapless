@@ -75,6 +75,7 @@ kill -0 "$APP" 2>/dev/null || { echo "app died on launch:"; cat "$CFG/app.log"; 
 BASE="http://127.0.0.1:$PORT"
 api()  { curl -s -m 10 -H "Authorization: Bearer $KEY" "$@"; }
 code() { curl -s -m 10 -o /dev/null -w '%{http_code}' "$@"; }
+now_path() { api "$BASE/api/status" | python3 -c 'import json,sys;t=json.load(sys.stdin).get("track") or {};print(t.get("path"))'; }
 field() { python3 -c 'import json,sys;d=json.load(sys.stdin);print(d.get(sys.argv[1]))' "$1"; }
 
 check() { # label  expected  actual
@@ -347,6 +348,22 @@ check "and it can come back"                200 \
       "$(code -H "Authorization: Bearer $KEY" "$BASE/api/status")"
 
 echo
+echo "=== opening a song from the file manager ==="
+# What "Open with Gapless" does: a second launch with the file as its argument,
+# forwarded to this copy over the bus. It has to PLAY that song — not just bring
+# the window up on whatever was queued before.
+NQ=$(find "$TESTDATA" -maxdepth 1 -type f \( -name '*.mp3' -o -name '*.flac' \) | wc -l)
+"$BIN" "$TESTDATA/flac-part2.flac" >"$CFG/open.log" 2>&1
+sleep 2
+check "the clicked song is the one playing"   "$TESTDATA/flac-part2.flac" "$(now_path)"
+check "it is actually playing"                True "$(api "$BASE/api/status" | field playing)"
+check "its folder came with it"               "$NQ" "$(api "$BASE/api/status" | field queue_length)"
+"$BIN" "$TESTDATA/mp3-part1.mp3" >>"$CFG/open.log" 2>&1
+sleep 2
+check "a second song plays in the same queue" "$TESTDATA/mp3-part1.mp3" "$(now_path)"
+check "the queue was not rebuilt"             "$NQ" "$(api "$BASE/api/status" | field queue_length)"
+
+echo
 echo "=== one state, not two ==="
 # SIGKILL, so nothing can be written by a clean-shutdown path: what is on disk
 # has to have been saved as each API call was made.
@@ -360,6 +377,16 @@ print(s.get("shuffle_mode"), s["repeat"], s["crossfade_secs"])')"
 check "shuffle reached state.json"   favorites "$disk_shuffle"
 check "repeat reached state.json"    one       "$disk_repeat"
 check "crossfade reached state.json" 3.0       "$disk_xfade"
+
+echo
+echo "=== a cold start with a song ==="
+# Nothing running: the launch itself carries the file, and it plays straight away.
+"$BIN" "$TESTDATA/mp3-part2.mp3" >"$CFG/cold.log" 2>&1 &
+APP3=$!
+sleep 5
+check "a cold launch plays the clicked song" "$TESTDATA/mp3-part2.mp3" "$(now_path)"
+check "and is playing"                       True "$(api "$BASE/api/status" | field playing)"
+kill -9 "$APP3" 2>/dev/null; wait "$APP3" 2>/dev/null
 
 echo
 echo "=== the switch really is a switch ==="

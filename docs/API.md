@@ -99,7 +99,7 @@ the key needs nothing else to get started.
 | `POST /api/repeat` | `{mode: off\|all\|one}` |
 | `POST /api/shuffle` | `{mode: off\|on\|favorites}` |
 | `POST /api/rating` | `{index\|path, stars}` |
-| `POST /api/open` | `{path}` — a folder or a playlist |
+| `POST /api/open` | `{path}` — a folder, a playlist, or a song (queues the folder it is in) |
 | `GET /api/settings` | playback settings |
 | `POST /api/settings` | `{trim_silence?, crossfade_secs?, inner_silence_secs?, force_tempo?, target_bpm?, max_stretch_percent?, only_faster?}` |
 | `GET /api/tempo` | `{index\|path}` — a track's BPM and the speed it will play at |

@@ -47,22 +47,44 @@ pub fn tracks_from_paths(paths: &[PathBuf]) -> Vec<Track> {
 const EXTENSIONS: &[&str] =
     &["mp3", "flac", "ogg", "oga", "opus", "m4a", "aac", "wav", "wv", "ape", "mpc"];
 
+/// True for a file the scanner would pick up. The extension, not a sniff: it is
+/// the same test `scan` applies, so "opens" and "would be in the folder" agree.
+pub fn is_audio(path: &Path) -> bool {
+    path.extension()
+        .and_then(|x| x.to_str())
+        .map(|x| EXTENSIONS.contains(&x.to_ascii_lowercase().as_str()))
+        .unwrap_or(false)
+}
+
+/// The audio files directly inside `dir`, in album order — no recursion. What a
+/// single file opened from a file manager brings with it: its neighbours, not
+/// everything under its parent, which for a song saved to `~` is the whole home.
+pub fn scan_shallow(dir: &Path) -> Vec<Track> {
+    let mut tracks: Vec<Track> = WalkDir::new(dir)
+        .max_depth(1)
+        .follow_links(true)
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|e| e.file_type().is_file() && is_audio(e.path()))
+        .map(|e| read_track(e.path()))
+        .collect();
+    sort_album_order(&mut tracks);
+    tracks
+}
+
 pub fn scan(root: &Path) -> Vec<Track> {
     let mut tracks: Vec<Track> = WalkDir::new(root)
         .follow_links(true)
         .into_iter()
         .filter_map(Result::ok)
-        .filter(|e| e.file_type().is_file())
-        .filter(|e| {
-            e.path()
-                .extension()
-                .and_then(|x| x.to_str())
-                .map(|x| EXTENSIONS.contains(&x.to_ascii_lowercase().as_str()))
-                .unwrap_or(false)
-        })
+        .filter(|e| e.file_type().is_file() && is_audio(e.path()))
         .map(|e| read_track(e.path()))
         .collect();
+    sort_album_order(&mut tracks);
+    tracks
+}
 
+fn sort_album_order(tracks: &mut [Track]) {
     tracks.sort_by(|a, b| {
         a.album
             .cmp(&b.album)
@@ -70,7 +92,6 @@ pub fn scan(root: &Path) -> Vec<Track> {
             .then(a.track_no.cmp(&b.track_no))
             .then(a.path.cmp(&b.path))
     });
-    tracks
 }
 
 pub fn read_track(path: &Path) -> Track {

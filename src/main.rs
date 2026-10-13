@@ -187,17 +187,68 @@ fn main() -> glib::ExitCode {
     // because the first is already bound to the configured one.
     let second = std::env::args().skip(1).any(|a| a == "--new-instance");
 
-    let app = adw::Application::builder()
-        .application_id(APP_ID)
-        .flags(if second {
-            gtk::gio::ApplicationFlags::NON_UNIQUE
-        } else {
-            gtk::gio::ApplicationFlags::empty()
-        })
-        .build();
-    app.connect_activate(build_window);
-    // GTK would otherwise try to parse our own flags as GApplication options.
-    app.run_with_args::<&str>(&[])
+    // HANDLES_OPEN is what makes "open with Gapless" in a file manager do
+    // anything. Without it GApplication refuses file arguments outright, and the
+    // launch arrives as a plain `activate`: the window comes up on last
+    // session's queue and the song that was clicked is never mentioned.
+    let mut flags = gtk::gio::ApplicationFlags::HANDLES_OPEN;
+    if second {
+        flags |= gtk::gio::ApplicationFlags::NON_UNIQUE;
+    }
+    let app = adw::Application::builder().application_id(APP_ID).flags(flags).build();
+
+    // One window per process. A second launch — from the menu, or with files —
+    // is forwarded here by GApplication and must reuse it: building another
+    // would start a second audio engine playing over the first.
+    let built: Rc<RefCell<Option<(Rc<Ui>, Arc<Player>)>>> = Rc::new(RefCell::new(None));
+    app.connect_activate({
+        let built = built.clone();
+        move |app| {
+            if built.borrow().is_some() {
+                if let Some(w) = app.active_window() {
+                    w.present();
+                }
+                return;
+            }
+            let made = build_window(app);
+            *built.borrow_mut() = made;
+        }
+    });
+    app.connect_open({
+        let built = built.clone();
+        move |app, files, _| {
+            if built.borrow().is_none() {
+                let made = build_window(app);
+                *built.borrow_mut() = made;
+            }
+            // Cloned out so no borrow is held across the load, which runs GTK
+            // and can re-enter this handler's neighbours.
+            let pair = built.borrow().clone();
+            let Some((ui, player)) = pair else { return };
+            let paths: Vec<PathBuf> = files.iter().filter_map(|f| f.path()).collect();
+            open_and_play(&ui, &player, &paths);
+            if let Some(w) = app.active_window() {
+                w.present();
+            }
+        }
+    });
+    // Only the files reach GApplication. Our own flags would be rejected as
+    // unknown options, and `--api-port`'s value would be taken for a file.
+    app.run_with_args(&gtk_args())
+}
+
+/// argv[0] plus every argument that is not one of ours — the files to open.
+fn gtk_args() -> Vec<String> {
+    let mut out: Vec<String> = std::env::args().take(1).collect();
+    let mut args = std::env::args().skip(1);
+    while let Some(a) = args.next() {
+        if a == "--api-port" {
+            args.next();
+        } else if !a.starts_with('-') {
+            out.push(a);
+        }
+    }
+    out
 }
 
 /// The About dialog — the only place the *running* app states its version.
@@ -220,7 +271,7 @@ fn show_about(parent: &impl IsA<gtk::Widget>) {
     about.present(Some(parent));
 }
 
-fn build_window(app: &adw::Application) {
+fn build_window(app: &adw::Application) -> Option<(Rc<Ui>, Arc<Player>)> {
     // The desktop may have `gtk-primary-button-warps-slider` off (KDE ships it
     // that way), which makes clicking a slider's trough page-step towards the
     // pointer instead of jumping to it. For a seek bar that is simply wrong: you
@@ -249,7 +300,7 @@ fn build_window(app: &adw::Application) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("could not start audio engine: {e}");
-            return;
+            return None;
         }
     };
 
@@ -539,6 +590,7 @@ fn build_window(app: &adw::Application) {
     persist_on_signal(app, &ui, &player);
 
     window.present();
+    Some((ui, player))
 }
 
 /// Crossfade and silence-trim live together because they are the two answers to
@@ -1751,11 +1803,45 @@ fn apply_rating(ui: &Rc<Ui>, player: &Arc<Player>, track: usize, stars: u8) {
 /// difference: `library::scan` sorts by album/disc/track, which is right for a
 /// folder and wrong for a playlist. A hand-sequenced set is precisely where
 /// gapless matters most, so its order is preserved exactly as written.
+/// What a file manager's "open" means: play the thing that was clicked. A song
+/// already in the queue is simply played; otherwise its source — the song's
+/// folder, or the playlist or folder itself — is loaded first. Only the first
+/// path counts: a queue has one source, and the rest of a multi-selection is
+/// usually that same folder anyway.
+fn open_and_play(ui: &Rc<Ui>, player: &Arc<Player>, paths: &[PathBuf]) {
+    let Some(path) = paths.iter().find(|p| p.exists()) else { return };
+    let want = library::is_audio(path).then(|| path.clone());
+    let queued = |ui: &Rc<Ui>| {
+        want.as_ref()
+            .and_then(|w| ui.tracks.borrow().iter().position(|t| &t.path == w))
+    };
+    let index = match queued(ui) {
+        Some(i) => Some(i),
+        None => {
+            load_source(ui, player, path.clone());
+            if want.is_some() { queued(ui) } else { Some(0) }
+        }
+    };
+    let Some(i) = index.filter(|&i| i < ui.tracks.borrow().len()) else { return };
+    if let Err(e) = player.play_index(i) {
+        eprintln!("play failed: {e}");
+    }
+}
+
 fn load_source(ui: &Rc<Ui>, player: &Arc<Player>, path: PathBuf) {
     let (tracks, subtitle) = if path.is_dir() {
         let tracks = library::scan(&path);
         let n = tracks.len();
         (tracks, format!("{n} tracks"))
+    } else if library::is_audio(&path) {
+        // One song, opened from a file manager: queue the folder it sits in, so
+        // the album carries on after it. Kept as the source *as the file*, so a
+        // restart restores the same shallow folder rather than scanning deep.
+        let dir = path.parent().unwrap_or(std::path::Path::new("."));
+        let tracks = library::scan_shallow(dir);
+        let name = dir.file_name().and_then(|n| n.to_str()).unwrap_or("Folder");
+        let n = tracks.len();
+        (tracks, format!("{name} · {n} tracks"))
     } else {
         match playlist::parse(&path) {
             Ok(pl) => {
@@ -2374,7 +2460,7 @@ fn dispatch(ui: &Rc<Ui>, player: &Arc<Player>, req: &ApiRequest) -> ApiResponse 
                 "POST /api/repeat":    "{mode: off|all|one}",
                 "POST /api/shuffle":   "{mode: off|on|favorites}",
                 "POST /api/rating":    "{index|path, stars: 0-5}",
-                "POST /api/open":      "{path} — a folder or a playlist file",
+                "POST /api/open":      "{path} — a folder, a playlist file, or a song (queues its folder)",
                 "GET  /api/settings":  "playback settings",
                 "POST /api/settings":  "{trim_silence?, crossfade_secs?, inner_silence_secs?, force_tempo?, target_bpm?, max_stretch_percent?, only_faster?}",
                 "GET  /api/tempo":     "{index|path} — a track's BPM, and the speed it will play at",
