@@ -67,6 +67,10 @@ both, and can crossfade instead if you'd rather.
 - Repeat off/all/one, shuffle, ReplayGain, MPRIS2 (media keys + lock screen) —
   and a mode toggled from the lock screen or `playerctl` repaints the buttons and
   is saved, exactly as a click on them would be.
+- **Opens what you click** — double-click a song in a file manager, or *Open
+  with Gapless*, and that song plays, with the rest of its folder queued after
+  it. A song already in the queue just plays; a playlist or folder plays from the
+  top. Works whether Gapless is running or not.
 - M3U/M3U8/PLS playlists, **in playlist order**.
 - Album art, per-track detail (year, genre, codec, sample rate, bit depth).
 - **Resumes your session** — folder or playlist, volume, shuffle, repeat, and the
@@ -223,7 +227,7 @@ Four more scripts, each written after a real bug got past the ones above:
                                             # at 1.0x and stretched
 DISPLAY=:0 ./scripts/verify-mpris-modes.sh  # a mode set over D-Bus must survive a SIGKILL, must
                                             # not downgrade favorites shuffle, and Play must resume
-DISPLAY=:0 ./scripts/verify-api.sh          # 78 checks over a real socket against the real app
+DISPLAY=:0 ./scripts/verify-api.sh          # 88 checks over a real socket against the real app
 DISPLAY=:0 GAPLESS_INPUT_OK=1 \
   ./scripts/verify-input.sh      # the rating keys and the right-click menu, real input
 ```
