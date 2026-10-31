@@ -92,7 +92,8 @@ cargo run --release
 
 Then **Open Folder…** or **Open Playlist…**, and press play.
 
-The playback settings live behind the **gear button** in the header bar.
+The playback settings live behind the **gear button** in the header bar. On a
+short screen the panel scrolls.
 
 ### Force tempo
 
