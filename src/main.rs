@@ -761,7 +761,15 @@ fn build_prefs(ui: &Rc<Ui>, player: &Arc<Player>, saved: &Settings) -> gtk::Menu
     content.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
     content.append(&about_button);
 
-    let popover = gtk::Popover::builder().child(&content).build();
+    // The panel is taller than a 768-pixel screen, and a popover that cannot fit
+    // is never shown at all — the gear button did nothing. Scrolling gives it a
+    // small minimum height, so it shrinks to the screen instead.
+    let scroller = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .propagate_natural_height(true)
+        .child(&content)
+        .build();
+    let popover = gtk::Popover::builder().child(&scroller).build();
     about_button.connect_clicked({
         let popover = popover.clone();
         move |btn| {

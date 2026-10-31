@@ -5,6 +5,17 @@ All notable changes to Gapless. Newest first.
 The project is pre-1.0; entries are grouped by release and carry the commit
 that made them.
 
+## v0.6.2 — 2026-10-30
+
+### Fixed
+
+- **The gear button opens its settings on a smaller screen.** The panel had grown
+  to 778 px of content, so on a 768-pixel-high screen (or a 1080p one scaled up)
+  it could not fit, and a popover that cannot fit is never shown at all. Clicking
+  the gear did nothing. The panel now scrolls, so it shrinks to fit the screen.
+  On a screen tall enough it looks exactly as before. Reproduced on a 1024×768
+  broadway display: unmapped before the fix, shown at 673 px after it.
+
 ## v0.6.1 — 2026-10-13
 
 ### Fixed
